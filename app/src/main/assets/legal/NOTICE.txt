@@ -1,0 +1,24 @@
+Omochi distribution notices
+===========================
+
+Omochi application source is licensed under the Apache License 2.0.
+
+The APK includes an Android/Bionic PRoot runtime derived from Termux packages.
+PRoot is licensed under GPL-2.0. Corresponding source is bundled at
+legal/sources/proot-v5.1.107.92.zip.
+
+libandroid-shmem is licensed under the BSD 3-Clause license. Corresponding
+source is bundled at legal/sources/libandroid-shmem-v0.7.tar.gz.source.
+
+Samba talloc is licensed under LGPL-3.0-or-later. Corresponding source is
+bundled at legal/sources/talloc-2.4.3.tar.gz.source.
+
+The runtime preparation script and Termux build-recipe snapshots used to
+produce these binaries are bundled under legal/sources/.
+
+Apache Commons Compress is distributed under Apache License 2.0. Its notice is
+bundled at legal/licenses/COMMONS-COMPRESS-NOTICE.txt.
+
+code-server is not bundled in the APK. Omochi downloads the pinned official
+standalone archive from coder/code-server during user-initiated setup. Its own
+licenses and notices remain in the downloaded distribution.
