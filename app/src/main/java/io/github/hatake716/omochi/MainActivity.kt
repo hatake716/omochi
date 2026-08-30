@@ -524,7 +524,7 @@ private fun WorkspaceCard(
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("ワークスペース", style = MaterialTheme.typography.titleLarge)
             Text(
-                "コードはアプリ専用の /workspace に保存されます。SAFで選んだ項目だけを安全に入出力します。",
+                "コードはアプリ専用の /workspace に保存されます。SAFで選んだ項目だけを安全に入出力します。スナップショットは .git を除く作業ファイルを書き出します。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = OmochiColors.Muted,
             )

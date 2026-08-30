@@ -53,4 +53,19 @@ class WorkspaceTransferTest {
             sandbox.deleteRecursively()
         }
     }
+
+    @Test
+    fun exportExcludesGitMetadataButKeepsWorkingFiles() {
+        assertTrue(WorkspaceTransfer.isExcludedExportEntry(File("/workspace/.git")))
+        assertFalse(WorkspaceTransfer.isExcludedExportEntry(File("/workspace/.gitignore")))
+        assertFalse(WorkspaceTransfer.isExcludedExportEntry(File("/workspace/src")))
+    }
+
+    @Test
+    fun exportMimeTypesDoNotAppendTxtToSourceFiles() {
+        assertEquals("text/plain", WorkspaceTransfer.mimeType("notes.txt"))
+        assertEquals("application/octet-stream", WorkspaceTransfer.mimeType("README.md"))
+        assertEquals("application/octet-stream", WorkspaceTransfer.mimeType("Main.kt"))
+        assertEquals("image/png", WorkspaceTransfer.mimeType("icon.png"))
+    }
 }

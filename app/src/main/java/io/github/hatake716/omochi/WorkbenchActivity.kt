@@ -477,8 +477,57 @@ class WorkbenchActivity : ComponentActivity() {
         alt: Boolean = false,
         shift: Boolean = false
     ) {
-        dispatchKey(keyCode, modifierState(ctrl, alt, shift))
+        val view = webView ?: return
+        val browserKey = when (keyCode) {
+            KeyEvent.KEYCODE_E -> BrowserKey("e", "KeyE", 69)
+            KeyEvent.KEYCODE_F -> BrowserKey("f", "KeyF", 70)
+            KeyEvent.KEYCODE_G -> BrowserKey("g", "KeyG", 71)
+            KeyEvent.KEYCODE_P -> BrowserKey("p", "KeyP", 80)
+            KeyEvent.KEYCODE_S -> BrowserKey("s", "KeyS", 83)
+            KeyEvent.KEYCODE_Z -> BrowserKey("z", "KeyZ", 90)
+            KeyEvent.KEYCODE_GRAVE -> BrowserKey("`", "Backquote", 192)
+            else -> {
+                dispatchKey(keyCode, modifierState(ctrl, alt, shift))
+                return
+            }
+        }
+
+        // Android KeyEvent -> WebView の変換では、仮想キーボード由来の英字に
+        // KeyboardEvent.code が設定されない。VS Code は code ベースで
+        // Ctrl+Shift+G / Ctrl+` などを解決するため、タッチツールバーからの
+        // ショートカットだけは DOM 側へ明示的な key/code を送る。
+        val options = """
+            {
+              key: ${JSONObject.quote(browserKey.key)},
+              code: ${JSONObject.quote(browserKey.code)},
+              keyCode: ${browserKey.virtualKeyCode},
+              which: ${browserKey.virtualKeyCode},
+              ctrlKey: $ctrl,
+              altKey: $alt,
+              shiftKey: $shift,
+              bubbles: true,
+              cancelable: true,
+              composed: true
+            }
+        """.trimIndent()
+        view.evaluateJavascript(
+            """
+                (() => {
+                  const target = document.activeElement || document.body;
+                  const options = $options;
+                  target.dispatchEvent(new KeyboardEvent('keydown', options));
+                  target.dispatchEvent(new KeyboardEvent('keyup', options));
+                })();
+            """.trimIndent(),
+            null,
+        )
     }
+
+    private data class BrowserKey(
+        val key: String,
+        val code: String,
+        val virtualKeyCode: Int,
+    )
 
     private fun handleNamedShortcut(name: String) {
         when (name) {

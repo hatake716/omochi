@@ -137,6 +137,11 @@ object WorkspaceTransfer {
         onProgress: (Progress) -> Unit,
         relative: String
     ) {
+        // PRoot の --link2symlink は Git の loose object 作成時の hard link を
+        // rootfs/.l2s 配下への疑似リンクへ変換する。これを追跡して SAF へ
+        // 書き出すとワークスペース外参照を許すことになるため、Git 管理情報は
+        // スナップショット対象から外し、作業ツリーの実ファイルだけを書き出す。
+        if (isExcludedExportEntry(source)) return
         if (!isSafeExportSource(workspaceRoot, source)) {
             throw IOException("シンボリックリンクまたはワークスペース外の項目は書き出せません: $relative")
         }
@@ -187,6 +192,8 @@ object WorkspaceTransfer {
         return candidate.path == root.path ||
             candidate.path.startsWith(root.path + File.separator)
     }
+
+    internal fun isExcludedExportEntry(source: File): Boolean = source.name == ".git"
 
     private fun displayName(context: Context, uri: Uri): String? {
         context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
@@ -241,9 +248,11 @@ object WorkspaceTransfer {
         return result.toString()
     }
 
-    private fun mimeType(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
-        "txt", "md", "kt", "kts", "java", "js", "ts", "json", "xml", "yaml", "yml",
-        "toml", "nix", "py", "sh", "c", "h", "cpp", "rs", "go", "html", "css" -> "text/plain"
+    internal fun mimeType(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
+        // ExternalStorageProvider は text/plain と未知の拡張子を組み合わせると
+        // `main.kt.txt` のように `.txt` を補う。コードは MIME より正確な
+        // ファイル名を優先し、既知のメディア形式以外は octet-stream にする。
+        "txt" -> "text/plain"
         "png" -> "image/png"
         "jpg", "jpeg" -> "image/jpeg"
         "webp" -> "image/webp"
