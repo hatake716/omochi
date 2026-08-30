@@ -59,16 +59,16 @@ jobs:
           unzip -l "$APK" | grep 'assets/legal/licenses/LGPL-3.0.txt'
           unzip -l "$APK" | grep 'assets/legal/sources/proot-v5.1.107.92.zip'
           unzip -l "$APK" | grep 'assets/legal/SOURCE-AND-LICENSE-MANIFEST.sha256'
-          cp "$APK" app/build/outputs/apk/debug/Omochi-v0.1.0-debug.apk
-          sha256sum app/build/outputs/apk/debug/Omochi-v0.1.0-debug.apk \
-            > app/build/outputs/apk/debug/Omochi-v0.1.0-debug.apk.sha256
+          cp "$APK" app/build/outputs/apk/debug/Omochi-v0.3.0-debug.apk
+          sha256sum app/build/outputs/apk/debug/Omochi-v0.3.0-debug.apk \
+            > app/build/outputs/apk/debug/Omochi-v0.3.0-debug.apk.sha256
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: omochi-v0.1.0-debug
+          name: omochi-v0.3.0-debug
           if-no-files-found: error
           retention-days: 14
           path: |
-            app/build/outputs/apk/debug/Omochi-v0.1.0-debug.apk
-            app/build/outputs/apk/debug/Omochi-v0.1.0-debug.apk.sha256
+            app/build/outputs/apk/debug/Omochi-v0.3.0-debug.apk
+            app/build/outputs/apk/debug/Omochi-v0.3.0-debug.apk.sha256
