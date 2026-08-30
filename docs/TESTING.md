@@ -19,6 +19,8 @@ The unit suite currently checks:
 - loopback-only server URL;
 - VS Code-compatible language-pack cache hashing;
 - completion-marker parsing, including comments, malformed rows, and values containing `=`;
+- exact active-loopback URL acceptance and rejection of lookalike host, port, scheme, and user-info URLs;
+- explicit external-browser scheme allowlist;
 - SAF destination-name sanitization and component length;
 - SAF export containment, including direct and nested symlink rejection.
 
@@ -55,6 +57,18 @@ An installed APK is not a successful IDE test. Continue through setup and visibl
 5. Observe Ubuntu download, extraction, PRoot self-test, IDE download, SHA verification, Linux packages,
    Japanese Language Pack verification/indexing, Claude signing-key verification/install, and both self-tests.
 6. Confirm 100% and **ワークベンチを開く**.
+7. Leave the workbench, tap the Omochi app icon, and confirm the first visible app screen is the workbench rather
+   than the setup dashboard. Tap the workbench back action and confirm the dashboard remains reachable.
+
+Before setup, repeat an app-icon launch and confirm it routes to the dashboard rather than starting an invalid
+workbench session. For a migration-pending installation, confirm the dashboard remains the first screen until
+the Japanese UI and Claude Code completion marker is valid.
+
+Pixel 10a / Android 17 evidence from 2026-08-31: a force-stopped, setup-complete installation followed
+`LauncherActivity -> WorkbenchActivity` with no `MainActivity` transition and displayed the workbench in
+1.194 seconds. Launching from the dashboard then reached the workbench while retaining the same app and PRoot
+PIDs. Launching while an existing workbench was backgrounded reused the same Activity record and returned it
+to the foreground in 92 milliseconds.
 
 For an existing v0.1 installation, use **日本語UIとClaude Codeを導入** and verify that `/workspace`
 contents and Git state remain unchanged after migration.
@@ -75,16 +89,18 @@ adb logcat --pid="$(adb shell pidof io.github.hatake716.omochi.debug)"
 
 ### 4. Touch chrome
 
-Tap every Omochi title-bar action and confirm the visible destination:
+Tap every fixed bottom-dock action and confirm the visible destination:
 
-- Explorer;
+- File Explorer;
 - Search;
 - Source Control;
+- Run and Debug;
 - Terminal;
 - Command Palette;
-- yellow traffic light (touch bar);
-- green traffic light (fullscreen);
-- red traffic light (return home).
+
+Use the 48dp top actions to show/hide the touch panel, enter/leave fullscreen, and return home. Switch the
+touch panel between **キー** and **編集**. Confirm Enter, Backspace, Find/Replace, Quick Open, editor split,
+and new-terminal actions in addition to Esc/Tab/arrows.
 
 Latch Ctrl/Alt/Shift in the bottom bar and verify it resets after the next ordinary key.
 
@@ -108,6 +124,29 @@ production credentials in a disposable test environment.
 Expected Claude output contains a semantic version and `(Claude Code)`. Running bare `claude` is a separate
 online/account boundary: complete the first login manually with a supported Anthropic account, inspect every
 requested permission, and do not record tokens or private login screens.
+
+For the browser handoff regression:
+
+1. Start `claude` in the integrated terminal and open its HTTPS authentication link.
+2. Confirm Android shows the **Omochi IDEセッション実行中** foreground notification.
+3. Leave the browser foreground for at least five minutes without swiping either task away.
+4. Return from Recents or the notification and verify the same terminal still shows the pending/login result.
+5. Confirm `/healthz` and both code-server WebSockets remained connected, and that no
+   `ApplicationExitInfo` crash/low-memory exit was recorded for Omochi during the handoff.
+6. Tap **セッションを停止** only after the test and confirm PRoot/code-server exits.
+
+Pixel 10a / Android 17 regression evidence from 2026-08-31:
+
+- Before the IME opened, the workbench occupied `[0,304][1080,1872]`; with the Japanese IME visible it
+  resized to `[0,304][1080,1496]`. The xterm input remained at `[716,1214][740,1262]`, above the keyboard.
+- The native touch-key panel and navigation dock were absent from the accessibility tree while the IME was
+  visible. A physical Japanese Gboard tap produced `あ` in xterm, and Backspace removed it.
+- An external HTTPS documentation link kept the browser foreground for 60 seconds. The Omochi app PID,
+  PRoot/code-server process tree, foreground-service state, terminal, and loopback port remained unchanged;
+  `/healthz` heartbeats advanced and the remote-agent log recorded no WebSocket disconnect.
+- Android Back returned to the same `WorkbenchActivity`, which displayed the session-continuity notice.
+  No Anthropic credentials were entered, so the real account-login result and five-minute soak remain manual
+  acceptance steps.
 
 ### 6. Japanese UI
 
@@ -136,6 +175,8 @@ visible Japanese Settings/workbench check.
 - Android split-screen;
 - show/hide IME repeatedly;
 - background for 1, 5, and 20 minutes;
+- external browser foreground during a running terminal/OAuth flow;
+- notification reopen and explicit session stop;
 - lock/unlock;
 - return after WebView renderer memory pressure;
 - reopen after Android kills the app process.

@@ -24,7 +24,7 @@ Kotlin and Jetpack Compose. It owns:
 - touch shortcuts and modifier latching;
 - Android IME and hardware-key dispatch into WebView;
 - SAF import/export;
-- the loopback process lifecycle;
+- a user-visible foreground service for the loopback process lifecycle;
 - legal/source disclosure.
 
 ### PRoot
@@ -111,14 +111,33 @@ rootfs and `/workspace`, adds the Japanese UI and Claude Code, verifies both, an
 
 ## 4. Runtime lifecycle
 
+`LauncherActivity` is the only exported Activity. It reads the runtime and Japanese/Claude completion markers,
+then immediately routes an app-icon launch to `WorkbenchActivity` only when both setup stages are complete.
+Fresh or migration-pending installations route to the setup dashboard instead. The router runs in a
+recents-excluded empty-affinity task, has no history, and opens the destination with
+`FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_REORDER_TO_FRONT`. Android therefore executes the routing decision on
+every icon tap while reusing an existing workbench instead of stacking a duplicate. `MainActivity` and
+`WorkbenchActivity` remain unexported; the workbench back action explicitly opens the dashboard when import,
+export, setup, or session controls are needed.
+
 `OmochiServerManager` starts one process per Android app process, selects a currently free loopback port, and
 records a generation number. Reader and health-probe threads ignore stale generations after a restart. Server
 output is capped/rotated under `files/logs/`. Readiness requires the expected JSON response from `/healthz`;
 process creation by itself is not treated as success.
 
-The current implementation is intentionally foreground-oriented. It does not start an Android foreground
-service, so Android may reclaim the process after the app is backgrounded. Reopening starts or probes the
-server again.
+`OmochiServerService` owns that manager as a user-started foreground service of type `specialUse`. The service
+starts while `WorkbenchActivity` is visible, posts an ongoing low-importance notification, and remains visible
+to Android when an OAuth or documentation link moves the external browser to the foreground. This prevents
+the app UID and its PRoot/code-server children from being treated as an ordinary cached background process.
+The notification opens the workbench and provides an explicit **セッションを停止** action. Swiping the
+Omochi task does not silently end a terminal login flow; stopping the notification session terminates the
+app-owned PRoot tree, including code-server, extension-host, and terminal descendants, before another session
+can start.
+
+If the app process is reclaimed despite foreground importance, the sticky service recreates the local server
+against the same app-private user data and `/workspace`. An Activity or WebView recreation reconnects to the
+manager's current URL instead of owning the server lifetime. The service never changes the network boundary:
+code-server still binds only the dynamically selected `127.0.0.1` port.
 
 ## 5. Workspace and SAF
 
@@ -136,19 +155,29 @@ The app does not access another application's Termux prefix or data directory.
 
 ## 6. Touch adaptation
 
-The Android title bar maps taps to real workbench keyboard commands:
+The fixed bottom dock maps large labeled taps to real workbench keyboard commands:
 
 | Android control | Workbench command key |
 |---|---|
 | Explorer | Ctrl+Shift+E |
 | Search | Ctrl+Shift+F |
 | Source Control | Ctrl+Shift+G |
+| Run and Debug | Ctrl+Shift+D |
 | Terminal | Ctrl+` |
 | Command Palette | Ctrl+Shift+P |
 
-The bottom key bar sends Android keyboard events, including latched Ctrl/Alt/Shift metadata. A CSS/DOM layer
-increases list rows, tabs, action icons, menu rows, buttons, and scrollbars for touch. It also hides the
-Extensions Activity without changing the workbench's file/editor layout engine.
+The touch panel separates keyboard controls from editing actions so the user does not have to search one very
+long strip. The key page provides Esc, latched Ctrl/Alt/Shift, Tab, arrows, Enter, Backspace, and Japanese IME.
+The editing page provides Save, Undo/Redo, Find/Replace, Quick Open, editor split, and a new terminal. Every
+native primary target is at least 48 dp. When the Android IME is visible the navigation dock collapses and the
+workbench root consumes the IME inset while the redundant touch-key panel and navigation dock collapse. The
+editor and terminal are therefore resized above the keyboard instead of being covered. On phone-width viewports
+the restored primary and auxiliary sidebars are initially collapsed; the fixed dock opens them on demand.
+
+A bounded CSS/DOM layer increases Code list rows, tabs, action icons, menus, buttons, quick-pick rows, status
+bar, and scrollbars for touch. Extension hiding uses a short bounded scan after load rather than an unbounded
+whole-document mutation scan. The WebView supports user-initiated popup links but routes every non-loopback
+HTTP(S)/mail target through Android, including Claude authentication pages.
 
 ## 7. Security decisions
 
@@ -162,6 +191,7 @@ Extensions Activity without changing the workbench's file/editor layout engine.
   `31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE`.
 - Tar output paths are canonicalized and constrained under the selected extraction root.
 - External links are not loaded with the privileged local workbench origin.
+- The foreground notification makes every long-running local IDE session visible and user-stoppable.
 - No credentials are embedded in source or APK.
 
 Git credentials entered inside the Linux environment remain in the app-private rootfs. The project does not

@@ -10,7 +10,7 @@ ARM64 Android向けのオープンソースIDEです。
 ![Android](https://img.shields.io/badge/Android-8.0%2B-3DDC84)
 ![Architecture](https://img.shields.io/badge/ABI-arm64--v8a-555555)
 ![License](https://img.shields.io/badge/License-Apache--2.0-blue)
-![Status](https://img.shields.io/badge/status-v0.2.0%20development-C96954)
+![Status](https://img.shields.io/badge/status-v0.3.0%20development-C96954)
 
 </div>
 
@@ -44,11 +44,12 @@ Claude CodeはAnthropic公式の署名済みstable APTリポジトリからUbunt
 - 設定、キーバインド、コマンドパレット、Quick Open、ワークスペース設定
 - Explorer、設定、コマンドパレット、ターミナル等の日本語UI
 - 統合ターミナルから起動できるClaude Code（初回のAnthropic認証はユーザー操作）
+- Claude認証ブラウザを開いてもIDE／ターミナルを維持する、通知付きローカルセッション
 - JavaScript / TypeScript / JSON / HTML / CSS / Markdown等、配布物に含まれる組み込み言語機能
 - SAFによるファイル／フォルダ取込と、上書きしないタイムスタンプ付きワークスペース書出
-- macOS風のウィンドウクローム、交通信号ボタン、淡色パレット、角丸、半透明感
-- Explorer、検索、Git、ターミナル、コマンドパレットを直接開く44dp級タッチボタン
-- Esc / Ctrl / Alt / Shift / Tab / 矢印 / Save / Undo / Redo / Find等のタッチキーバー
+- macOS風のウィンドウクローム、淡色パレット、角丸、半透明ダッシュボード
+- ファイル、検索、Git、実行、端末、コマンドを直接開く48dp以上の固定タッチドック
+- キー／編集の2面に整理したEsc、修飾キー、矢印、IME、保存、置換、分割等のタッチ操作
 - 日本語を含むAndroid IME入力、ハードウェアキーボード、ピンチ・スクロール
 
 外部拡張マーケットは製品設定から除去し、Extensions ActivityもAndroid側のタッチレイヤーで非表示にします。
@@ -72,10 +73,11 @@ Googleアカウントを要求するものではありません。
 ```text
 ┌──────────────── Android application ────────────────┐
 │ macOS-like Compose shell                            │
-│   Welcome / setup / SAF import-export / touch bar   │
+│   Dashboard / SAF / fixed dock / touch key panels   │
 │                         │                            │
 │ Android WebView ─────── HTTP + WebSocket ─────┐     │
 │                                               │     │
+│ Foreground IDE session service                 │     │
 │ PRoot (Android/Bionic, no root)                │     │
 │   Ubuntu Base 24.04.4                          │     │
 │   code-server 4.133.0 ── 127.0.0.1:<dynamic> ◀─┘     │
@@ -108,12 +110,14 @@ Claude Code約96 MiBに加え、Git等のUbuntuパッケージです。合計約
 1. APKを端末へ直接インストールします。
 2. Omochiを開き、**Omochiをセットアップ**を押します。
 3. Ubuntu Base、code-server、Git／SSH／検索ツール、日本語UI、Claude Codeの準備が100%になるまで待ちます。
-4. **ワークベンチを開く**を押します。
-5. Explorerで新規作成するか、ホーム画面の**ファイル取込／フォルダ取込**を使います。
+4. 初回だけ**ワークベンチを開く**を押します。以後はアプリアイコンから直接ワークベンチが開きます。
+5. Explorerで新規作成するか、ホーム画面の**ファイルを取り込む／フォルダを取り込む**を使います。
 6. Gitリポジトリは統合ターミナルで `git clone` するか、Source Controlから開きます。
-7. Claude Codeは統合ターミナルで `claude` を実行し、初回だけ画面の案内に従ってAnthropicへ認証します。
+7. ホームの**ターミナルでClaudeを開く**を押し、`claude`を実行します。初回認証で外部ブラウザへ
+   移動しても通知中のIDEセッションは継続します。完了後はOmochiへ戻ってください。
 
 セットアップは検証済みのダウンロードキャッシュを再利用します。途中で失敗した場合は再度ボタンを押せます。
+セットアップ後にホーム画面の取込・書出・管理機能を使う場合は、ワークベンチ左上の戻るボタンを押してください。
 
 ## ビルド
 
@@ -190,6 +194,8 @@ Ubuntu環境へ導入する必要があります。外部拡張なしで利用�
 
 - IDEサーバーは起動ごとに選んだ空きポートで `127.0.0.1` のみにbindし、LANへ公開しません。
 - loopback以外のURLはWebView内で開かず、Androidの外部ブラウザへ渡します。
+- ユーザーがワークベンチを開いた間は通知付きフォアグラウンドサービスでローカルIDEを維持し、
+  通知の**セッションを停止**から明示的に終了できます。
 - WebViewの通常ファイルアクセスとcontentアクセスは無効です。
 - code-serverはアプリ専用領域に生成した256-bitランダムパスワードで認証し、WebViewだけを自動ログインさせます。
 - Workspace TrustはCode - OSS標準のまま有効です。テレメトリとcode-server更新確認は無効化しています。
@@ -216,7 +222,8 @@ AndroidのNetwork Security ConfigはWebView／Androidフレームワーク側の
 - Claude Codeはワークスペースの読書きやコマンド実行が可能です。提示された変更と許可要求を確認してください。
 - 日本語Language Packが翻訳しない設定識別子・製品名・新規上流機能は英語のまま表示される場合があります。
 - Android WebView上のCode - OSSなので、Electron固有の複数ネイティブウィンドウ等はありません。
-- サーバープロセスは現在アプリプロセス管理です。ワークベンチを閉じた後の常駐実行は保証しません。
+- ローカルIDEの実行中はAndroidの継続通知が表示されます。通知を許可しない場合もAndroidの
+  アクティブアプリ管理には表示され、そこから停止できます。
 - Androidの省メモリ処理、画面回転、長時間バックグラウンド、巨大リポジトリは実機検証が必要です。
 - USB／Bluetooth／シリアル等のAndroidハードウェア統合はまだありません。
 - 外部拡張、Microsoft Settings Sync、Remote Development系拡張は対象外です。

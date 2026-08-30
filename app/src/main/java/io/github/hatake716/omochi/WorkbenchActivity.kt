@@ -1,10 +1,14 @@
 package io.github.hatake716.omochi
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Message
 import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
@@ -31,7 +35,6 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,21 +45,27 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.AccountTree
-import androidx.compose.material.icons.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.Fullscreen
+import androidx.compose.material.icons.outlined.FullscreenExit
 import androidx.compose.material.icons.outlined.Keyboard
+import androidx.compose.material.icons.outlined.KeyboardHide
 import androidx.compose.material.icons.outlined.MoreHoriz
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Terminal
@@ -83,12 +92,17 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.net.toUri
+import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import java.net.URI
 import org.json.JSONObject
 
 class WorkbenchActivity : ComponentActivity() {
+    companion object {
+        const val EXTRA_OPEN_TERMINAL = "io.github.hatake716.omochi.extra.OPEN_TERMINAL"
+    }
+
     private var webView: WebView? = null
     private var loadedUrl: String? = null
     private var serverState by mutableStateOf<OmochiServerManager.State>(
@@ -99,8 +113,13 @@ class WorkbenchActivity : ComponentActivity() {
     private var ctrlLatched by mutableStateOf(false)
     private var altLatched by mutableStateOf(false)
     private var shiftLatched by mutableStateOf(false)
+    private var touchPanelPage by mutableStateOf(TouchPanelPage.Keys)
     private var fullscreenEnabled by mutableStateOf(false)
+    private var browserNotice by mutableStateOf<String?>(null)
+    private var externalBrowserPending = false
+    private var initialTerminalPending = false
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+    private val popupWebViews = mutableSetOf<WebView>()
 
     private val chooseWebFiles = registerForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
@@ -108,6 +127,10 @@ class WorkbenchActivity : ComponentActivity() {
         fileChooserCallback?.onReceiveValue(uris.toTypedArray())
         fileChooserCallback = null
     }
+
+    private val requestNotificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* The foreground session remains valid even when shade notifications are denied. */ }
 
     private val serverListener: (OmochiServerManager.State) -> Unit = { state ->
         serverState = state
@@ -120,16 +143,19 @@ class WorkbenchActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (!OmochiRuntime.isInstalled(this)) {
-            finish()
+            openHome()
             return
         }
 
         enableEdgeToEdge()
+        initialTerminalPending = intent.getBooleanExtra(EXTRA_OPEN_TERMINAL, false)
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         installBackHandler()
 
         OmochiServerManager.addListener(serverListener)
-        OmochiServerManager.start(this)
+        OmochiServerService.start(this).onFailure {
+            webError = "IDEセッションを開始できません: ${it.message ?: it.javaClass.simpleName}"
+        }
 
         setContent {
             OmochiTheme {
@@ -140,37 +166,52 @@ class WorkbenchActivity : ComponentActivity() {
                     ctrlLatched = ctrlLatched,
                     altLatched = altLatched,
                     shiftLatched = shiftLatched,
+                    touchPanelPage = touchPanelPage,
+                    fullscreenEnabled = fullscreenEnabled,
                     createWebView = ::createWebView,
-                    onClose = { finish() },
+                    onClose = ::openHome,
                     onToggleTouchBar = { showTouchBar = !showTouchBar },
                     onToggleFullscreen = ::toggleFullscreen,
-                    onExplorer = { sendShortcut(KeyEvent.KEYCODE_E, ctrl = true, shift = true) },
-                    onSearch = { sendShortcut(KeyEvent.KEYCODE_F, ctrl = true, shift = true) },
-                    onSourceControl = { sendShortcut(KeyEvent.KEYCODE_G, ctrl = true, shift = true) },
+                    onExplorer = { activateWorkbenchView("codicon-explorer-view-icon") },
+                    onSearch = { activateWorkbenchView("codicon-search-view-icon") },
+                    onSourceControl = { activateWorkbenchView("codicon-source-control-view-icon") },
                     onTerminal = { sendShortcut(KeyEvent.KEYCODE_GRAVE, ctrl = true) },
                     onCommandPalette = { sendShortcut(KeyEvent.KEYCODE_P, ctrl = true, shift = true) },
                     onRetry = ::retry,
                     onToggleCtrl = { ctrlLatched = !ctrlLatched },
                     onToggleAlt = { altLatched = !altLatched },
                     onToggleShift = { shiftLatched = !shiftLatched },
+                    onTouchPanelPage = { touchPanelPage = it },
                     onKey = ::sendLatchedKey,
                     onShortcut = ::handleNamedShortcut,
                     onShowIme = ::showIme,
+                    browserNotice = browserNotice,
+                    onDismissBrowserNotice = { browserNotice = null },
                 )
             }
         }
+
+        requestSessionNotificationPermissionOnce()
     }
 
     override fun onResume() {
         super.onResume()
         webView?.onResume()
+        if (externalBrowserPending) {
+            externalBrowserPending = false
+            browserNotice = "ブラウザから戻りました。IDEとターミナルのセッションは継続しています。"
+        }
         if (OmochiServerManager.state() is OmochiServerManager.State.Failed) {
-            OmochiServerManager.start(this)
+            OmochiServerService.restart(this).onFailure {
+                webError = "IDEセッションを再起動できません: ${it.message ?: it.javaClass.simpleName}"
+            }
         }
     }
 
     override fun onPause() {
-        webView?.onPause()
+        // Keep the WebView connection warm for the explicit browser-auth flow. Other
+        // background transitions may pause rendering to save resources.
+        if (!externalBrowserPending) webView?.onPause()
         super.onPause()
     }
 
@@ -186,6 +227,7 @@ class WorkbenchActivity : ComponentActivity() {
             view.destroy()
         }
         webView = null
+        popupWebViews.toList().forEach(::destroyPopup)
         super.onDestroy()
     }
 
@@ -194,7 +236,7 @@ class WorkbenchActivity : ComponentActivity() {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    finish()
+                    openHome()
                 }
 
                 override fun handleOnBackStarted(backEvent: BackEventCompat) = Unit
@@ -204,11 +246,37 @@ class WorkbenchActivity : ComponentActivity() {
         )
     }
 
+    private fun openHome() {
+        startActivity(
+            Intent(this, MainActivity::class.java).addFlags(
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
+        )
+        finish()
+    }
+
     private fun retry() {
         webError = null
         loadedUrl = null
-        OmochiServerManager.stop()
-        OmochiServerManager.start(this)
+        OmochiServerService.restart(this).onFailure {
+            webError = "IDEセッションを再起動できません: ${it.message ?: it.javaClass.simpleName}"
+        }
+    }
+
+    private fun requestSessionNotificationPermissionOnce() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) return
+
+        val preferences = getSharedPreferences("omochi-ui", MODE_PRIVATE)
+        if (preferences.getBoolean("session-notification-prompted-v1", false)) return
+        preferences.edit { putBoolean("session-notification-prompted-v1", true) }
+        window.decorView.post {
+            if (!isFinishing && !isDestroyed) {
+                requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
     }
 
     private fun loadWorkbench(url: String) {
@@ -234,9 +302,10 @@ class WorkbenchActivity : ComponentActivity() {
             domStorageEnabled = true
             allowFileAccess = false
             allowContentAccess = false
-            javaScriptCanOpenWindowsAutomatically = false
-            setSupportMultipleWindows(false)
-            builtInZoomControls = false
+            javaScriptCanOpenWindowsAutomatically = true
+            setSupportMultipleWindows(true)
+            setSupportZoom(true)
+            builtInZoomControls = true
             displayZoomControls = false
             useWideViewPort = true
             loadWithOverviewMode = false
@@ -265,6 +334,13 @@ class WorkbenchActivity : ComponentActivity() {
                 webError = null
                 if (!submitLocalLogin(view, url.toUri())) {
                     injectTouchWorkbench(view)
+                    if (initialTerminalPending) {
+                        initialTerminalPending = false
+                        view.postDelayed(
+                            { sendShortcut(KeyEvent.KEYCODE_GRAVE, ctrl = true) },
+                            1_200L,
+                        )
+                    }
                 }
             }
 
@@ -318,11 +394,33 @@ class WorkbenchActivity : ComponentActivity() {
                 )
                 return true
             }
+
+            override fun onCreateWindow(
+                view: WebView,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: Message,
+            ): Boolean {
+                if (!isUserGesture) return false
+                val popup = createRoutedPopupWebView()
+                popupWebViews += popup
+                val transport = resultMsg.obj as? WebView.WebViewTransport ?: run {
+                    destroyPopup(popup)
+                    return false
+                }
+                transport.webView = popup
+                resultMsg.sendToTarget()
+                return true
+            }
+
+            override fun onCloseWindow(window: WebView) {
+                destroyPopup(window)
+            }
         }
 
         setDownloadListener { url, _, _, _, _ ->
             if (url.startsWith("http://") || url.startsWith("https://")) {
-                runCatching { startActivity(Intent(Intent.ACTION_VIEW, url.toUri())) }
+                openExternalUri(url.toUri())
             }
         }
 
@@ -337,19 +435,69 @@ class WorkbenchActivity : ComponentActivity() {
         if (uri.scheme == "about" || uri.scheme == "blob" || uri.scheme == "data") return false
         if (isTrustedWorkbenchUri(uri)) return false
 
-        if (uri.scheme == "http" || uri.scheme == "https" || uri.scheme == "mailto") {
-            runCatching { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+        if (WorkbenchUrlPolicy.shouldOpenExternally(uri.scheme)) {
+            openExternalUri(uri)
         }
         return true
     }
 
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createRoutedPopupWebView(): WebView = WebView(this).apply {
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        settings.allowFileAccess = false
+        settings.allowContentAccess = false
+        webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val handled = routeUrl(request.url)
+                if (handled) destroyPopup(view)
+                return handled
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                val uri = runCatching { url.toUri() }.getOrNull() ?: return
+                if (!isTrustedWorkbenchUri(uri) &&
+                    (uri.scheme == "http" || uri.scheme == "https" || uri.scheme == "mailto")
+                ) {
+                    openExternalUri(uri)
+                    destroyPopup(view)
+                }
+            }
+        }
+    }
+
+    private fun destroyPopup(view: WebView) {
+        popupWebViews -= view
+        runCatching {
+            view.stopLoading()
+            view.webChromeClient = null
+            view.webViewClient = WebViewClient()
+            view.destroy()
+        }
+    }
+
+    private fun openExternalUri(uri: Uri) {
+        val session = OmochiServerService.start(this)
+        if (session.isFailure) {
+            externalBrowserPending = false
+            browserNotice = "IDEセッションを維持できないため、外部ブラウザを開きませんでした。"
+            return
+        }
+        val host = uri.host?.takeIf { it.isNotBlank() } ?: "外部サイト"
+        val result = runCatching {
+            externalBrowserPending = true
+            browserNotice = "$host をブラウザで開いています。Omochiのセッションは背後で維持されます。"
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
+        }
+        if (result.isFailure) {
+            externalBrowserPending = false
+            browserNotice = "このリンクを開けるブラウザが見つかりませんでした。"
+        }
+    }
+
     private fun isTrustedWorkbenchUri(uri: Uri): Boolean {
         val running = serverState as? OmochiServerManager.State.Running ?: return false
-        val expected = running.url.toUri()
-        return uri.scheme == "http" &&
-            uri.host == "127.0.0.1" &&
-            uri.host == expected.host &&
-            uri.port == expected.port
+        return WorkbenchUrlPolicy.isTrustedLoopback(running.url, uri.toString())
     }
 
     private fun submitLocalLogin(view: WebView, uri: Uri): Boolean {
@@ -395,50 +543,130 @@ class WorkbenchActivity : ComponentActivity() {
                 html, body { overscroll-behavior: none; }
                 .monaco-workbench { font-family: -apple-system, BlinkMacSystemFont, Roboto, sans-serif !important; }
                 .monaco-workbench .part.activitybar .action-item,
-                .monaco-workbench .part.activitybar .action-label { min-height: 46px !important; min-width: 46px !important; }
+                .monaco-workbench .part.activitybar .action-label { min-height: 48px !important; min-width: 48px !important; }
                 .monaco-workbench .part.sidebar .monaco-list-row,
-                .monaco-workbench .part.auxiliarybar .monaco-list-row { min-height: 30px !important; }
-                .monaco-workbench .tabs-container .tab { min-height: 40px !important; }
-                .monaco-workbench .tabs-container .tab .tab-label { line-height: 40px !important; }
-                .monaco-workbench .monaco-action-bar .action-item > .action-label { min-width: 34px; min-height: 34px; }
-                .monaco-workbench .monaco-button { min-height: 38px !important; border-radius: 8px !important; }
-                .monaco-workbench input, .monaco-workbench textarea { font-size: max(14px, 1em); }
-                .monaco-workbench .monaco-scrollable-element > .scrollbar.vertical { width: 13px !important; }
-                .monaco-workbench .monaco-scrollable-element > .scrollbar.horizontal { height: 13px !important; }
+                .monaco-workbench .part.auxiliarybar .monaco-list-row,
+                .monaco-workbench .quick-input-list .monaco-list-row { min-height: 40px !important; }
+                .monaco-workbench .tabs-container .tab { min-height: 44px !important; }
+                .monaco-workbench .tabs-container .tab .tab-label { line-height: 44px !important; }
+                .monaco-workbench .monaco-action-bar .action-item > .action-label { min-width: 42px; min-height: 42px; }
+                .monaco-workbench .monaco-button { min-height: 44px !important; border-radius: 10px !important; }
+                .monaco-workbench input, .monaco-workbench textarea { font-size: max(16px, 1em); }
+                .monaco-workbench .xterm-helper-textarea { font-size: 16px !important; }
+                .monaco-workbench .monaco-scrollable-element > .scrollbar.vertical { width: 16px !important; }
+                .monaco-workbench .monaco-scrollable-element > .scrollbar.horizontal { height: 16px !important; }
                 .quick-input-widget { top: 6% !important; width: min(92vw, 720px) !important; margin-left: auto !important; margin-right: auto !important; border-radius: 14px !important; overflow: hidden; }
                 .context-view, .monaco-menu-container { max-width: calc(100vw - 12px) !important; }
-                .monaco-menu .monaco-action-bar.vertical .action-item { min-height: 38px !important; }
-                .monaco-workbench .part.statusbar { min-height: 27px !important; }
+                .monaco-menu .monaco-action-bar.vertical .action-item { min-height: 44px !important; }
+                .monaco-workbench .part.statusbar { min-height: 32px !important; }
+                .monaco-workbench .breadcrumbs-below-tabs { min-height: 38px !important; }
+                .monaco-workbench .notifications-toasts .notification-toast { border-radius: 12px !important; }
                 [data-id="workbench.view.extensions"],
                 [data-command-id="workbench.view.extensions"] { display: none !important; }
                 @media (max-width: 600px) {
-                  .monaco-workbench .part.sidebar { min-width: 220px !important; }
-                  .monaco-workbench .part.panel { min-height: 180px !important; }
+                  .monaco-workbench .part.panel { min-height: 200px !important; }
                   .monaco-workbench .codicon { font-size: 18px; }
+                  .monaco-dialog-box {
+                    box-sizing: border-box !important;
+                    width: calc(100vw - 16px) !important;
+                    min-width: 0 !important;
+                    max-width: calc(100vw - 16px) !important;
+                    height: min(76vh, 420px) !important;
+                    min-height: 300px !important;
+                    max-height: calc(100vh - 24px) !important;
+                    overflow: hidden !important;
+                  }
+                  .monaco-dialog-box .dialog-toolbar-row {
+                    box-sizing: border-box !important;
+                    width: 100% !important;
+                    max-width: 100% !important;
+                    flex: 0 0 48px !important;
+                  }
+                  .monaco-dialog-box .dialog-message-row {
+                    box-sizing: border-box !important;
+                    width: 100% !important;
+                    max-width: 100% !important;
+                    height: auto !important;
+                    min-height: 0 !important;
+                    flex: 1 1 auto !important;
+                    overflow: hidden !important;
+                  }
+                  .monaco-dialog-box .dialog-message-container {
+                    box-sizing: border-box !important;
+                    width: calc(100% - 24px) !important;
+                    min-width: 0 !important;
+                    max-width: calc(100% - 24px) !important;
+                    height: 100% !important;
+                    max-height: 100% !important;
+                    overflow: auto !important;
+                  }
+                  .monaco-dialog-box .dialog-message {
+                    height: auto !important;
+                    min-height: 44px !important;
+                    align-items: flex-start !important;
+                  }
+                  .monaco-dialog-box .dialog-buttons-row {
+                    box-sizing: border-box !important;
+                    width: 100% !important;
+                    max-width: 100% !important;
+                    height: auto !important;
+                    min-height: 60px !important;
+                    flex: 0 0 auto !important;
+                    overflow: visible !important;
+                  }
+                  .monaco-dialog-box .dialog-buttons {
+                    box-sizing: border-box !important;
+                    width: 100% !important;
+                    max-width: 100% !important;
+                    height: auto !important;
+                    flex-wrap: wrap !important;
+                    overflow: visible !important;
+                  }
+                  .monaco-dialog-box .dialog-buttons .monaco-button { max-width: 100% !important; }
                 }
               `;
               document.head.appendChild(style);
 
-              let scheduled = false;
               const hideExtensions = () => {
-                scheduled = false;
+                let hidden = false;
                 document.querySelectorAll('[aria-label], [data-id], [data-command-id]').forEach((element) => {
                   const label = (element.getAttribute('aria-label') || '').toLowerCase();
                   const id = (element.getAttribute('data-id') || element.getAttribute('data-command-id') || '').toLowerCase();
                   if (id.includes('workbench.view.extensions') || label === 'extensions' || label.startsWith('extensions ') || label.includes('拡張機能')) {
                     const target = element.closest('.action-item') || element;
                     target.style.setProperty('display', 'none', 'important');
+                    hidden = true;
                   }
                 });
+                return hidden;
               };
-              const scheduleHide = () => {
-                if (!scheduled) {
-                  scheduled = true;
-                  requestAnimationFrame(hideExtensions);
-                }
+
+              const prepareCompactLayout = () => {
+                if (window.innerWidth > 600 || window.__omochiCompactLayoutPrepared) return true;
+                const workbench = document.querySelector('.monaco-workbench');
+                const activeView = document.querySelector('.part.activitybar .action-item.checked');
+                if (!workbench || !activeView) return false;
+
+                const auxiliaryClose = document.querySelector(
+                  '.part.auxiliarybar .action-label.codicon-auxiliarybar-close'
+                );
+                if (auxiliaryClose) auxiliaryClose.click();
+
+                const sidebar = document.querySelector('.part.sidebar');
+                if (sidebar && sidebar.getBoundingClientRect().width > 0) activeView.click();
+                window.__omochiCompactLayoutPrepared = true;
+                return true;
               };
-              new MutationObserver(scheduleHide).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-label'] });
+
               hideExtensions();
+              prepareCompactLayout();
+              let passes = 0;
+              const extensionTimer = window.setInterval(() => {
+                const hidden = hideExtensions();
+                const compact = prepareCompactLayout();
+                passes += 1;
+                if ((hidden && compact) || passes >= 20) window.clearInterval(extensionTimer);
+              }, 250);
             })();
         """.trimIndent()
         view.evaluateJavascript(script, null)
@@ -463,6 +691,11 @@ class WorkbenchActivity : ComponentActivity() {
         input.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
     }
 
+    private fun activateWorkbenchView(iconClass: String) {
+        val selector = JSONObject.quote(".part.activitybar .action-label.$iconClass")
+        webView?.evaluateJavascript("document.querySelector($selector)?.click()", null)
+    }
+
     private fun sendLatchedKey(keyCode: Int) {
         val meta = modifierState(ctrlLatched, altLatched, shiftLatched)
         dispatchKey(keyCode, meta)
@@ -479,9 +712,12 @@ class WorkbenchActivity : ComponentActivity() {
     ) {
         val view = webView ?: return
         val browserKey = when (keyCode) {
+            KeyEvent.KEYCODE_BACKSLASH -> BrowserKey("\\", "Backslash", 220)
+            KeyEvent.KEYCODE_D -> BrowserKey("d", "KeyD", 68)
             KeyEvent.KEYCODE_E -> BrowserKey("e", "KeyE", 69)
             KeyEvent.KEYCODE_F -> BrowserKey("f", "KeyF", 70)
             KeyEvent.KEYCODE_G -> BrowserKey("g", "KeyG", 71)
+            KeyEvent.KEYCODE_H -> BrowserKey("h", "KeyH", 72)
             KeyEvent.KEYCODE_P -> BrowserKey("p", "KeyP", 80)
             KeyEvent.KEYCODE_S -> BrowserKey("s", "KeyS", 83)
             KeyEvent.KEYCODE_Z -> BrowserKey("z", "KeyZ", 90)
@@ -535,8 +771,11 @@ class WorkbenchActivity : ComponentActivity() {
             "undo" -> sendShortcut(KeyEvent.KEYCODE_Z, ctrl = true)
             "redo" -> sendShortcut(KeyEvent.KEYCODE_Z, ctrl = true, shift = true)
             "find" -> sendShortcut(KeyEvent.KEYCODE_F, ctrl = true)
+            "replace" -> sendShortcut(KeyEvent.KEYCODE_H, ctrl = true)
             "quickOpen" -> sendShortcut(KeyEvent.KEYCODE_P, ctrl = true)
+            "splitEditor" -> sendShortcut(KeyEvent.KEYCODE_BACKSLASH, ctrl = true)
             "newTerminal" -> sendShortcut(KeyEvent.KEYCODE_GRAVE, ctrl = true, shift = true)
+            "runAndDebug" -> sendShortcut(KeyEvent.KEYCODE_D, ctrl = true, shift = true)
         }
     }
 
@@ -570,6 +809,8 @@ class WorkbenchActivity : ComponentActivity() {
     }
 }
 
+private enum class TouchPanelPage { Keys, Edit }
+
 @Composable
 private fun WorkbenchScreen(
     serverState: OmochiServerManager.State,
@@ -578,6 +819,8 @@ private fun WorkbenchScreen(
     ctrlLatched: Boolean,
     altLatched: Boolean,
     shiftLatched: Boolean,
+    touchPanelPage: TouchPanelPage,
+    fullscreenEnabled: Boolean,
     createWebView: () -> WebView,
     onClose: () -> Unit,
     onToggleTouchBar: () -> Unit,
@@ -591,9 +834,12 @@ private fun WorkbenchScreen(
     onToggleCtrl: () -> Unit,
     onToggleAlt: () -> Unit,
     onToggleShift: () -> Unit,
+    onTouchPanelPage: (TouchPanelPage) -> Unit,
     onKey: (Int) -> Unit,
     onShortcut: (String) -> Unit,
     onShowIme: () -> Unit,
+    browserNotice: String?,
+    onDismissBrowserNotice: () -> Unit,
 ) {
     val imeBottom = with(LocalDensity.current) { WindowInsets.ime.getBottom(this).toDp() }
     val navigationBottom = with(LocalDensity.current) { WindowInsets.navigationBars.getBottom(this).toDp() }
@@ -603,18 +849,16 @@ private fun WorkbenchScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(OmochiColors.Window)
-            .windowInsetsPadding(WindowInsets.statusBars),
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .imePadding(),
     ) {
-        WorkbenchTitleBar(
+        StudioTopBar(
             state = serverState,
+            touchPanelVisible = showTouchBar,
+            fullscreenEnabled = fullscreenEnabled,
             onClose = onClose,
-            onToggleTouchBar = onToggleTouchBar,
+            onToggleTouchPanel = onToggleTouchBar,
             onToggleFullscreen = onToggleFullscreen,
-            onExplorer = onExplorer,
-            onSearch = onSearch,
-            onSourceControl = onSourceControl,
-            onTerminal = onTerminal,
-            onCommandPalette = onCommandPalette,
         )
 
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -624,157 +868,292 @@ private fun WorkbenchScreen(
             )
 
             when (serverState) {
-                OmochiServerManager.State.Stopped -> LoadingPanel("IDEサーバーを開始しています…")
+                OmochiServerManager.State.Stopped -> LoadingPanel("IDEセッションを開始しています…")
                 is OmochiServerManager.State.Starting -> LoadingPanel(serverState.message)
                 is OmochiServerManager.State.Failed -> ErrorPanel(serverState.message, onRetry)
                 is OmochiServerManager.State.Running -> {
                     if (webError != null) ErrorPanel(webError, onRetry)
                 }
             }
+
+            browserNotice?.let {
+                BrowserSessionNotice(
+                    message = it,
+                    onDismiss = onDismissBrowserNotice,
+                    modifier = Modifier.align(Alignment.TopCenter),
+                )
+            }
         }
 
-        if (showTouchBar) {
-            TouchKeyBar(
+        if (showTouchBar && !imeVisible) {
+            TouchControlPanel(
+                page = touchPanelPage,
                 ctrlLatched = ctrlLatched,
                 altLatched = altLatched,
                 shiftLatched = shiftLatched,
+                onPageChange = onTouchPanelPage,
                 onToggleCtrl = onToggleCtrl,
                 onToggleAlt = onToggleAlt,
                 onToggleShift = onToggleShift,
                 onKey = onKey,
                 onShortcut = onShortcut,
                 onShowIme = onShowIme,
-                modifier = if (imeVisible) Modifier else Modifier.windowInsetsPadding(WindowInsets.navigationBars),
             )
-        } else if (!imeVisible) {
-            Spacer(Modifier.windowInsetsPadding(WindowInsets.navigationBars))
+        }
+
+        if (!imeVisible) {
+            WorkspaceDock(
+                onExplorer = onExplorer,
+                onSearch = onSearch,
+                onSourceControl = onSourceControl,
+                onRun = { onShortcut("runAndDebug") },
+                onTerminal = onTerminal,
+                onCommandPalette = onCommandPalette,
+                modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars),
+            )
         }
     }
 }
 
 @Composable
-private fun WorkbenchTitleBar(
+private fun StudioTopBar(
     state: OmochiServerManager.State,
+    touchPanelVisible: Boolean,
+    fullscreenEnabled: Boolean,
     onClose: () -> Unit,
-    onToggleTouchBar: () -> Unit,
+    onToggleTouchPanel: () -> Unit,
     onToggleFullscreen: () -> Unit,
-    onExplorer: () -> Unit,
-    onSearch: () -> Unit,
-    onSourceControl: () -> Unit,
-    onTerminal: () -> Unit,
-    onCommandPalette: () -> Unit,
 ) {
+    val stateText = when (state) {
+        OmochiServerManager.State.Stopped -> "待機中"
+        is OmochiServerManager.State.Starting -> "起動中"
+        is OmochiServerManager.State.Running -> "ローカル接続中"
+        is OmochiServerManager.State.Failed -> "再接続が必要"
+    }
+    val stateColor = when (state) {
+        is OmochiServerManager.State.Running -> OmochiColors.Green
+        is OmochiServerManager.State.Failed -> OmochiColors.Red
+        else -> OmochiColors.Yellow
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(52.dp)
-            .background(
-                Brush.verticalGradient(listOf(Color(0xFFF9F7F5), Color(0xFFE8E3DE)))
-            )
+            .height(58.dp)
+            .background(Brush.verticalGradient(listOf(Color(0xFFFBFAF8), Color(0xFFE9E4DF))))
             .border(0.5.dp, OmochiColors.Border)
-            .padding(horizontal = 9.dp),
+            .padding(horizontal = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        TrafficButton(OmochiColors.Red, "閉じる", onClose)
-        TrafficButton(OmochiColors.Yellow, "タッチキー", onToggleTouchBar)
-        TrafficButton(OmochiColors.Green, "フルスクリーン", onToggleFullscreen)
-        Spacer(Modifier.width(10.dp))
-        Text(
-            text = "Omochi",
-            style = MaterialTheme.typography.labelLarge,
-            color = OmochiColors.Ink,
-            modifier = Modifier.weight(1f),
+        TopAction(Icons.AutoMirrored.Outlined.ArrowBack, "ホームへ戻る", onClose)
+        MacTrafficLights()
+        Column(modifier = Modifier.weight(1f).padding(horizontal = 9.dp)) {
+            Text(
+                "Omochi",
+                style = MaterialTheme.typography.labelLarge,
+                color = OmochiColors.Ink,
+                maxLines = 1,
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(7.dp).clip(CircleShape).background(stateColor))
+                Spacer(Modifier.width(5.dp))
+                Text(
+                    stateText,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = OmochiColors.Muted,
+                    maxLines = 1,
+                )
+            }
+        }
+        TopAction(
+            icon = if (touchPanelVisible) Icons.Outlined.KeyboardHide else Icons.Outlined.Keyboard,
+            label = if (touchPanelVisible) "タッチキーを隠す" else "タッチキーを表示",
+            onClick = onToggleTouchPanel,
+            active = touchPanelVisible,
         )
-        Box(
-            Modifier
-                .size(8.dp)
-                .clip(CircleShape)
-                .background(if (state is OmochiServerManager.State.Running) OmochiColors.Green else OmochiColors.Yellow)
+        TopAction(
+            icon = if (fullscreenEnabled) Icons.Outlined.FullscreenExit else Icons.Outlined.Fullscreen,
+            label = if (fullscreenEnabled) "フルスクリーンを終了" else "フルスクリーン",
+            onClick = onToggleFullscreen,
         )
-        Spacer(Modifier.width(4.dp))
-        ToolbarButton(Icons.Outlined.FolderOpen, "エクスプローラー", onExplorer)
-        ToolbarButton(Icons.Outlined.Search, "検索", onSearch)
-        ToolbarButton(Icons.Outlined.AccountTree, "Git", onSourceControl)
-        ToolbarButton(Icons.Outlined.Terminal, "ターミナル", onTerminal)
-        ToolbarButton(Icons.Outlined.MoreHoriz, "コマンド", onCommandPalette)
     }
 }
 
 @Composable
-private fun TrafficButton(color: Color, label: String, onClick: () -> Unit) {
-    IconButton(
-        onClick = onClick,
-        modifier = Modifier.size(34.dp).semantics { contentDescription = label },
+private fun MacTrafficLights() {
+    Row(
+        modifier = Modifier.padding(start = 1.dp, end = 3.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Box(
-            Modifier
-                .size(13.dp)
-                .clip(CircleShape)
-                .background(color)
-                .border(0.5.dp, Color.Black.copy(alpha = 0.17f), CircleShape)
-        )
+        listOf(OmochiColors.Red, OmochiColors.Yellow, OmochiColors.Green).forEach { color ->
+            Box(
+                Modifier
+                    .size(10.dp)
+                    .clip(CircleShape)
+                    .background(color)
+                    .border(0.5.dp, Color.Black.copy(alpha = 0.13f), CircleShape)
+            )
+        }
     }
 }
 
 @Composable
-private fun ToolbarButton(icon: ImageVector, label: String, onClick: () -> Unit) {
-    IconButton(onClick = onClick, modifier = Modifier.size(42.dp)) {
-        Icon(icon, contentDescription = label, tint = OmochiColors.Ink, modifier = Modifier.size(21.dp))
+private fun TopAction(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    active: Boolean = false,
+) {
+    Surface(
+        onClick = onClick,
+        color = if (active) OmochiColors.AccentSoft else Color.Transparent,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.size(48.dp).semantics { contentDescription = label },
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Icon(icon, contentDescription = null, tint = OmochiColors.Ink, modifier = Modifier.size(23.dp))
+        }
     }
 }
 
 @Composable
-private fun TouchKeyBar(
+private fun WorkspaceDock(
+    onExplorer: () -> Unit,
+    onSearch: () -> Unit,
+    onSourceControl: () -> Unit,
+    onRun: () -> Unit,
+    onTerminal: () -> Unit,
+    onCommandPalette: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = Color(0xFFFAF8F6),
+        tonalElevation = 5.dp,
+        shadowElevation = 7.dp,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(70.dp).padding(horizontal = 3.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            DockButton(Icons.Outlined.FolderOpen, "ファイル", onExplorer, Modifier.weight(1f))
+            DockButton(Icons.Outlined.Search, "検索", onSearch, Modifier.weight(1f))
+            DockButton(Icons.Outlined.AccountTree, "Git", onSourceControl, Modifier.weight(1f))
+            DockButton(Icons.Outlined.PlayArrow, "実行", onRun, Modifier.weight(1f))
+            DockButton(Icons.Outlined.Terminal, "端末", onTerminal, Modifier.weight(1f))
+            DockButton(Icons.Outlined.MoreHoriz, "コマンド", onCommandPalette, Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+private fun DockButton(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        onClick = onClick,
+        color = Color.Transparent,
+        shape = RoundedCornerShape(13.dp),
+        modifier = modifier.fillMaxSize(),
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Icon(icon, contentDescription = null, tint = OmochiColors.Ink, modifier = Modifier.size(23.dp))
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = OmochiColors.Ink,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TouchControlPanel(
+    page: TouchPanelPage,
     ctrlLatched: Boolean,
     altLatched: Boolean,
     shiftLatched: Boolean,
+    onPageChange: (TouchPanelPage) -> Unit,
     onToggleCtrl: () -> Unit,
     onToggleAlt: () -> Unit,
     onToggleShift: () -> Unit,
     onKey: (Int) -> Unit,
     onShortcut: (String) -> Unit,
     onShowIme: () -> Unit,
-    modifier: Modifier = Modifier,
 ) {
-    Row(
-        modifier = modifier
+    Column(
+        modifier = Modifier
             .fillMaxWidth()
-            .height(55.dp)
             .background(OmochiColors.Terminal)
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 6.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(5.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .border(0.5.dp, Color.White.copy(alpha = 0.1f)),
     ) {
-        KeyButton("ESC") { onKey(KeyEvent.KEYCODE_ESCAPE) }
-        KeyButton("CTRL", ctrlLatched, onToggleCtrl)
-        KeyButton("ALT", altLatched, onToggleAlt)
-        KeyButton("SHIFT", shiftLatched, onToggleShift)
-        KeyButton("TAB") { onKey(KeyEvent.KEYCODE_TAB) }
-        KeyButton("←") { onKey(KeyEvent.KEYCODE_DPAD_LEFT) }
-        KeyButton("↑") { onKey(KeyEvent.KEYCODE_DPAD_UP) }
-        KeyButton("↓") { onKey(KeyEvent.KEYCODE_DPAD_DOWN) }
-        KeyButton("→") { onKey(KeyEvent.KEYCODE_DPAD_RIGHT) }
-        KeyButton("保存") { onShortcut("save") }
-        KeyButton("元に戻す") { onShortcut("undo") }
-        KeyButton("やり直す") { onShortcut("redo") }
-        KeyButton("検索") { onShortcut("find") }
-        KeyButton("開く") { onShortcut("quickOpen") }
-        KeyButton("端末＋") { onShortcut("newTerminal") }
-        Surface(
-            onClick = onShowIme,
-            color = OmochiColors.Accent,
-            shape = RoundedCornerShape(9.dp),
-            modifier = Modifier.height(42.dp),
+        Row(
+            modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 7.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 13.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(Icons.Outlined.Keyboard, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("IME", color = Color.White, style = MaterialTheme.typography.labelLarge)
+            PanelTab("キー", page == TouchPanelPage.Keys) { onPageChange(TouchPanelPage.Keys) }
+            PanelTab("編集", page == TouchPanelPage.Edit) { onPageChange(TouchPanelPage.Edit) }
+            Text(
+                if (page == TouchPanelPage.Keys) "修飾キーは次の1入力に適用" else "よく使う編集操作",
+                color = Color.White.copy(alpha = 0.55f),
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.weight(1f).padding(start = 4.dp),
+                maxLines = 1,
+            )
+        }
+
+        androidx.compose.foundation.lazy.LazyRow(
+            modifier = Modifier.fillMaxWidth().height(60.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 7.dp, vertical = 5.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (page == TouchPanelPage.Keys) {
+                item { KeyButton("ESC") { onKey(KeyEvent.KEYCODE_ESCAPE) } }
+                item { KeyButton("CTRL", ctrlLatched, onToggleCtrl) }
+                item { KeyButton("ALT", altLatched, onToggleAlt) }
+                item { KeyButton("SHIFT", shiftLatched, onToggleShift) }
+                item { KeyButton("TAB") { onKey(KeyEvent.KEYCODE_TAB) } }
+                item { KeyButton("←") { onKey(KeyEvent.KEYCODE_DPAD_LEFT) } }
+                item { KeyButton("↑") { onKey(KeyEvent.KEYCODE_DPAD_UP) } }
+                item { KeyButton("↓") { onKey(KeyEvent.KEYCODE_DPAD_DOWN) } }
+                item { KeyButton("→") { onKey(KeyEvent.KEYCODE_DPAD_RIGHT) } }
+                item { KeyButton("ENTER") { onKey(KeyEvent.KEYCODE_ENTER) } }
+                item { KeyButton("⌫") { onKey(KeyEvent.KEYCODE_DEL) } }
+                item { ImeButton(onShowIme) }
+            } else {
+                item { KeyButton("保存") { onShortcut("save") } }
+                item { KeyButton("元に戻す") { onShortcut("undo") } }
+                item { KeyButton("やり直す") { onShortcut("redo") } }
+                item { KeyButton("検索") { onShortcut("find") } }
+                item { KeyButton("置換") { onShortcut("replace") } }
+                item { KeyButton("ファイルを開く") { onShortcut("quickOpen") } }
+                item { KeyButton("エディタ分割") { onShortcut("splitEditor") } }
+                item { KeyButton("新しい端末") { onShortcut("newTerminal") } }
+                item { ImeButton(onShowIme) }
             }
+        }
+    }
+}
+
+@Composable
+private fun PanelTab(label: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        color = if (selected) OmochiColors.Accent else Color(0xFF36383E),
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.height(48.dp).width(84.dp),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(label, color = Color.White, style = MaterialTheme.typography.labelLarge)
         }
     }
 }
@@ -783,13 +1162,59 @@ private fun TouchKeyBar(
 private fun KeyButton(label: String, active: Boolean = false, onClick: () -> Unit) {
     Surface(
         onClick = onClick,
-        color = if (active) OmochiColors.Accent else Color(0xFF34363B),
+        color = if (active) OmochiColors.Accent else Color(0xFF36383E),
         contentColor = Color.White,
-        shape = RoundedCornerShape(9.dp),
-        modifier = Modifier.height(42.dp),
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.height(50.dp).widthIn(min = 52.dp),
     ) {
-        Box(Modifier.padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
-            Text(label, style = MaterialTheme.typography.labelLarge, color = Color.White)
+        Box(Modifier.padding(horizontal = 14.dp), contentAlignment = Alignment.Center) {
+            Text(label, style = MaterialTheme.typography.labelLarge, color = Color.White, maxLines = 1)
+        }
+    }
+}
+
+@Composable
+private fun ImeButton(onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        color = OmochiColors.Accent,
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.height(50.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 15.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Outlined.Keyboard, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(7.dp))
+            Text("日本語入力", color = Color.White, style = MaterialTheme.typography.labelLarge)
+        }
+    }
+}
+
+@Composable
+private fun BrowserSessionNotice(
+    message: String,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = Color(0xF2232529),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(14.dp),
+        shadowElevation = 8.dp,
+        modifier = modifier.padding(10.dp).fillMaxWidth(),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 15.dp)) {
+            Box(Modifier.size(9.dp).clip(CircleShape).background(OmochiColors.Green))
+            Text(
+                message,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f).padding(horizontal = 11.dp, vertical = 11.dp),
+            )
+            IconButton(onClick = onDismiss, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Outlined.Close, contentDescription = "閉じる", tint = Color.White)
+            }
         }
     }
 }
@@ -800,14 +1225,31 @@ private fun LoadingPanel(message: String) {
         modifier = Modifier.fillMaxSize().background(OmochiColors.Window),
         contentAlignment = Alignment.Center,
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator(color = OmochiColors.Accent)
-            Text(
-                message,
-                style = MaterialTheme.typography.bodyLarge,
-                color = OmochiColors.Muted,
-                modifier = Modifier.padding(top = 16.dp, start = 24.dp, end = 24.dp),
-            )
+        Surface(
+            color = OmochiColors.Raised,
+            shape = RoundedCornerShape(24.dp),
+            shadowElevation = 6.dp,
+            modifier = Modifier.padding(24.dp).fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 28.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                CircularProgressIndicator(color = OmochiColors.Accent)
+                Text(
+                    message,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = OmochiColors.Muted,
+                    modifier = Modifier.padding(top = 18.dp),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                )
+                Text(
+                    "このセッションはブラウザを開いても継続します",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = OmochiColors.Muted,
+                    modifier = Modifier.padding(top = 7.dp),
+                )
+            }
         }
     }
 }
@@ -815,32 +1257,36 @@ private fun LoadingPanel(message: String) {
 @Composable
 private fun ErrorPanel(message: String, onRetry: () -> Unit) {
     Box(
-        modifier = Modifier.fillMaxSize().background(OmochiColors.Window.copy(alpha = 0.96f)),
+        modifier = Modifier.fillMaxSize().background(OmochiColors.Window.copy(alpha = 0.97f)),
         contentAlignment = Alignment.Center,
     ) {
         Surface(
             color = OmochiColors.Raised,
-            shape = RoundedCornerShape(20.dp),
+            shape = RoundedCornerShape(24.dp),
             shadowElevation = 8.dp,
-            modifier = Modifier.padding(24.dp).fillMaxWidth(),
+            modifier = Modifier.padding(22.dp).fillMaxWidth(),
         ) {
-            Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(Icons.Outlined.Refresh, contentDescription = null, tint = OmochiColors.Accent)
+            Column(Modifier.padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(Icons.Outlined.Refresh, contentDescription = null, tint = OmochiColors.Accent, modifier = Modifier.size(30.dp))
                 Text(
-                    "ワークベンチを開けません",
+                    "ワークベンチへ再接続できません",
                     style = MaterialTheme.typography.titleLarge,
-                    modifier = Modifier.padding(top = 10.dp),
+                    modifier = Modifier.padding(top = 11.dp),
                 )
                 Text(
                     message,
                     style = MaterialTheme.typography.bodyMedium,
                     color = OmochiColors.Muted,
-                    modifier = Modifier.padding(vertical = 12.dp),
+                    modifier = Modifier.padding(vertical = 13.dp),
                 )
-                Button(onClick = onRetry) {
+                Button(
+                    onClick = onRetry,
+                    modifier = Modifier.fillMaxWidth().height(56.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
                     Icon(Icons.Outlined.Refresh, contentDescription = null)
-                    Spacer(Modifier.width(7.dp))
-                    Text("再起動")
+                    Spacer(Modifier.width(8.dp))
+                    Text("IDEセッションを再起動")
                 }
             }
         }

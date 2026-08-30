@@ -3,6 +3,9 @@ package io.github.hatake716.omochi
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.Process as AndroidProcess
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import java.io.File
 import java.net.HttpURLConnection
@@ -10,9 +13,10 @@ import java.net.InetAddress
 import java.net.URI
 import java.net.ServerSocket
 import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-/** Keeps the loopback-only code-server process alive while the app is running. */
+/** Owns the loopback-only code-server process for [OmochiServerService]. */
 object OmochiServerManager {
     sealed interface State {
         data object Stopped : State
@@ -104,15 +108,117 @@ object OmochiServerManager {
     @Synchronized
     fun stop() {
         generation.incrementAndGet()
-        process?.let { running ->
-            runCatching {
-                running.destroy()
-                if (running.isAlive) running.destroyForcibly()
-            }
-        }
+        val port = activePort
+        process?.let { running -> terminateProcessTree(running, port) }
         process = null
         activePort = 0
         publish(State.Stopped)
+    }
+
+    /**
+     * PRoot and code-server form a host-side process tree. Android's regular
+     * [Process.destroy] can leave the traced guest and Node children alive, so an
+     * explicit user stop must terminate every app-owned descendant before a new
+     * session is allowed to start.
+     */
+    private fun terminateProcessTree(running: Process, port: Int) {
+        val serverPids = findManagedServerPids(port)
+        val knownPids = serverPids.flatMap(::ownedProcessTree).distinct()
+
+        runCatching { running.destroy() }
+        if (knownPids.isEmpty()) {
+            val exited = runCatching {
+                running.waitFor(500L, TimeUnit.MILLISECONDS)
+            }.getOrDefault(false)
+            if (!exited) {
+                runCatching { running.destroyForcibly() }
+                runCatching { running.waitFor(750L, TimeUnit.MILLISECONDS) }
+            }
+            return
+        }
+        if (waitForProcesses(knownPids, 500L)) return
+
+        signalProcesses(knownPids, OsConstants.SIGTERM)
+        if (waitForProcesses(knownPids, 750L)) return
+
+        val remaining = buildList {
+            addAll(knownPids)
+            findManagedServerPids(port).forEach { serverPid -> addAll(ownedProcessTree(serverPid)) }
+        }.distinct()
+        signalProcesses(remaining, OsConstants.SIGKILL)
+        runCatching { running.destroyForcibly() }
+        runCatching { running.waitFor(750L, TimeUnit.MILLISECONDS) }
+
+        val survivors = (remaining + findManagedServerPids(port))
+            .distinct()
+            .filter(::isOwnedProcess)
+        if (survivors.isNotEmpty()) {
+            Log.w(TAG, "IDE process tree still has app-owned survivors: $survivors")
+        }
+    }
+
+    private fun findManagedServerPids(port: Int): List<Int> {
+        if (port !in 1024..65535) return emptyList()
+        return File("/proc").listFiles().orEmpty().mapNotNull { entry ->
+            val pid = entry.name.toIntOrNull() ?: return@mapNotNull null
+            if (!isOwnedProcess(pid)) return@mapNotNull null
+            val command = runCatching {
+                File(entry, "cmdline").readBytes().toString(Charsets.UTF_8).replace('\u0000', ' ')
+            }.getOrDefault("")
+            pid.takeIf { command.contains("/opt/omochi/code-server-") }
+        }
+    }
+
+    private fun ownedProcessTree(rootPid: Int): List<Int> {
+        if (!isOwnedProcess(rootPid)) return emptyList()
+        val visited = linkedSetOf<Int>()
+        val pending = ArrayDeque<Int>().apply { add(rootPid) }
+        while (pending.isNotEmpty() && visited.size < 256) {
+            val pid = pending.removeFirst()
+            if (!visited.add(pid) || !isOwnedProcess(pid)) continue
+            processChildren(pid).forEach { child ->
+                if (child !in visited && isOwnedProcess(child)) pending.addLast(child)
+            }
+        }
+        return visited.toList()
+    }
+
+    private fun processChildren(pid: Int): List<Int> = runCatching {
+        File("/proc/$pid/task/$pid/children")
+            .readText()
+            .trim()
+            .split(Regex("\\s+"))
+            .mapNotNull(String::toIntOrNull)
+            .filter { it > 1 }
+    }.getOrDefault(emptyList())
+
+    private fun isOwnedProcess(pid: Int): Boolean = runCatching {
+        val uidLine = File("/proc/$pid/status")
+            .useLines { lines -> lines.firstOrNull { it.startsWith("Uid:") } }
+            ?: return@runCatching false
+        val realUid = uidLine.substringAfter(':').trim().split(Regex("\\s+")).first().toInt()
+        realUid == AndroidProcess.myUid()
+    }.getOrDefault(false)
+
+    private fun signalProcesses(pids: List<Int>, signal: Int) {
+        pids.asReversed().forEach { pid ->
+            if (isOwnedProcess(pid)) runCatching { Os.kill(pid, signal) }
+        }
+    }
+
+    private fun waitForProcesses(pids: List<Int>, timeoutMs: Long): Boolean {
+        if (pids.isEmpty()) return true
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (System.nanoTime() < deadline) {
+            if (pids.none(::isOwnedProcess)) return true
+            try {
+                Thread.sleep(25L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return pids.none(::isOwnedProcess)
     }
 
     private fun consumeOutput(context: Context, running: Process, runId: Long) {
@@ -135,7 +241,11 @@ object OmochiServerManager {
                         }
                     }
                 }
-            }.onFailure { Log.w(TAG, "Could not persist server output", it) }
+            }.onFailure {
+                if (generation.get() == runId && process === running) {
+                    Log.w(TAG, "Could not persist server output", it)
+                }
+            }
 
             if (generation.get() == runId && process === running) {
                 val exit = runCatching { running.exitValue() }.getOrDefault(-1)
