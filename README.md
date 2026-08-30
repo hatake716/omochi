@@ -10,15 +10,15 @@ ARM64 Android向けのオープンソースIDEです。
 ![Android](https://img.shields.io/badge/Android-8.0%2B-3DDC84)
 ![Architecture](https://img.shields.io/badge/ABI-arm64--v8a-555555)
 ![License](https://img.shields.io/badge/License-Apache--2.0-blue)
-![Status](https://img.shields.io/badge/status-v0.1.0%20development-C96954)
+![Status](https://img.shields.io/badge/status-v0.2.0%20development-C96954)
 
 </div>
 
 > [!IMPORTANT]
-> 現在は最初の実装版です。Android/Kotlinコンパイル、単体テスト、lint、APK構成を検証していますが、
-> Pixel 10aへdebug APKを導入した時点で端末がユーザー操作中だったため、アプリを勝手に前面へ出していません。
-> 初回ダウンロードから実際の編集までの実機E2Eは未完了です。詳細は
-> [機能マトリクス](docs/FEATURE_MATRIX.md) を参照してください。
+> 現在は開発版です。2026-08-30にPixel 10a（Android 17）で、Ubuntu／PRoot／code-serverの
+> 初回導入、loopback `/healthz` とWebSocket、日本語ワークベンチ、設定画面、統合ターミナル、
+> Claude Code 2.1.236の起動を実機確認しました。回転・長時間バックグラウンド・巨大リポジトリなど、
+> リリース前に継続確認する項目は[機能マトリクス](docs/FEATURE_MATRIX.md)を参照してください。
 
 ## Omochiとは
 
@@ -31,6 +31,10 @@ IDEサーバーは端末内の `127.0.0.1` に動的選択した空きポート�
 APKへ巨大なIDE本体を直接同梱せず、ユーザーが初回セットアップを押した時だけ公式GitHub Releaseから取得し、
 固定したSHA-256を検証してから展開します。
 
+設定・メニュー等の表示にはMicrosoft公式の日本語Language Packを使用します。Omochiが固定バージョンの
+VSIXを取得してSHA-256を検証し、code-serverが起動前に読めるローカライズ索引を生成します。また、
+Claude CodeはAnthropic公式の署名済みstable APTリポジトリからUbuntu環境へ導入します。
+
 ## 実装済みの体験
 
 - Explorer、複数タブ、エディタグループ／分割、差分エディタ、ミニマップ、折り畳み
@@ -38,6 +42,8 @@ APKへ巨大なIDE本体を直接同梱せず、ユーザーが初回セット�
 - 統合ターミナル、複数ターミナル、タスク、Problems、Output、Debug Console
 - Git clone、差分、ステージ、コミット、ブランチ、pull / pushなどの組み込みSource Control
 - 設定、キーバインド、コマンドパレット、Quick Open、ワークスペース設定
+- Explorer、設定、コマンドパレット、ターミナル等の日本語UI
+- 統合ターミナルから起動できるClaude Code（初回のAnthropic認証はユーザー操作）
 - JavaScript / TypeScript / JSON / HTML / CSS / Markdown等、配布物に含まれる組み込み言語機能
 - SAFによるファイル／フォルダ取込と、上書きしないタイムスタンプ付きワークスペース書出
 - macOS風のウィンドウクローム、交通信号ボタン、淡色パレット、角丸、半透明感
@@ -73,6 +79,7 @@ Googleアカウントを要求するものではありません。
 │ PRoot (Android/Bionic, no root)                │     │
 │   Ubuntu Base 24.04.4                          │     │
 │   code-server 4.133.0 ── 127.0.0.1:<dynamic> ◀─┘     │
+│   日本語Language Pack / Claude Code                  │
 │   Git / SSH / ripgrep / bash                         │
 │                         │                            │
 │                 /workspace bind                      │
@@ -92,17 +99,19 @@ Googleアカウントを要求するものではありません。
 - 初回セットアップ用のインターネット接続
 - 最低でも約1 GiB、実用上は2 GiB以上の空き容量を推奨
 
-初回取得量の目安は、Ubuntu Base約29 MiB、code-server約219 MiBに加え、Git等のUbuntuパッケージです。
-アーカイブ展開後はさらに容量を使います。
+初回取得量の目安は、Ubuntu Base約29 MiB、code-server約219 MiB、日本語Language Pack約0.7 MiB、
+Claude Code約96 MiBに加え、Git等のUbuntuパッケージです。合計約360 MiB以上を見込み、
+アーカイブ展開後と開発プロジェクト用にさらに容量を確保してください。
 
 ## 使い方
 
 1. APKを端末へ直接インストールします。
-2. Omochiを開き、**IDEをセットアップ**を押します。
-3. Ubuntu Base、code-server、Git／SSH／検索ツールの準備が100%になるまで待ちます。
+2. Omochiを開き、**Omochiをセットアップ**を押します。
+3. Ubuntu Base、code-server、Git／SSH／検索ツール、日本語UI、Claude Codeの準備が100%になるまで待ちます。
 4. **ワークベンチを開く**を押します。
 5. Explorerで新規作成するか、ホーム画面の**ファイル取込／フォルダ取込**を使います。
 6. Gitリポジトリは統合ターミナルで `git clone` するか、Source Controlから開きます。
+7. Claude Codeは統合ターミナルで `claude` を実行し、初回だけ画面の案内に従ってAnthropicへ認証します。
 
 セットアップは検証済みのダウンロードキャッシュを再利用します。途中で失敗した場合は再度ボタンを押せます。
 
@@ -153,6 +162,8 @@ DebugビルドのアプリIDは `io.github.hatake716.omochi.debug`、Releaseビ�
 | Ubuntu Base ARM64 | 24.04.4 | SHA-256 `04207713…37ac7ff2` |
 | code-server ARM64 standalone | 4.133.0 | SHA-256 `d999d8b0…d1c71147` |
 | Code | 1.133.0 | code-server公式配布物に内包 |
+| Microsoft Japanese Language Pack | 1.131.2026082318 | 公式VSIX・SHA-256 `baa2f930…b8afc28f` |
+| Claude Code | stable APT（実機確認時2.1.236） | Anthropic署名鍵 `31DD…CACE`・`claude --version` |
 | PRoot | Termux build based on 5.1.107.92 | バイナリ＋対応ソースをAPKに同梱 |
 
 code-server更新時は、バージョンだけでなくRelease assetの公式SHA-256、展開後ディレクトリ、
@@ -168,6 +179,9 @@ CLIフラグ、Codeのバージョンをまとめて検証します。
 - 外部拡張の正常動作を製品要件・テスト対象に含めない
 - Git、基本言語、テーマ等、Code - OSS配布物に組み込まれた機能は中核機能として使用
 
+日本語UIのためのMicrosoft公式Language Packだけは、任意拡張ではなくOmochiが管理する表示リソースとして
+固定バージョンを導入します。ユーザーによる外部VSIX導入やExtension Galleryを有効にするものではありません。
+
 言語コンパイラ、SDK、デバッガ実行ファイルはデスクトップ版VS Codeと同様、対象プロジェクトに応じて
 Ubuntu環境へ導入する必要があります。外部拡張なしで利用できない言語固有機能は、Omochiが独自に
 互換性を保証する範囲外です。
@@ -180,6 +194,8 @@ Ubuntu環境へ導入する必要があります。外部拡張なしで利用�
 - code-serverはアプリ専用領域に生成した256-bitランダムパスワードで認証し、WebViewだけを自動ログインさせます。
 - Workspace TrustはCode - OSS標準のまま有効です。テレメトリとcode-server更新確認は無効化しています。
 - code-serverアーカイブは展開前にSHA-256を検証します。
+- 日本語Language PackのVSIXも固定SHA-256を検証し、翻訳ファイルが拡張ディレクトリ外を指す場合は拒否します。
+- Claude CodeのAPT署名鍵は完全なfingerprintを照合してからstableリポジトリを登録します。
 - tar展開先はcanonical pathで検証し、`../` によるアプリ領域外への脱出を拒否します。
 - SAF取込は既存項目を上書きせず、衝突時は新しい名前を作ります。
 - SAF書出は常に新しいタイムスタンプ付きフォルダを作ります。
@@ -194,7 +210,11 @@ AndroidのNetwork Security ConfigはWebView／Androidフレームワーク側の
 ## 現在の制約
 
 - ARM64専用。x86_64エミュレータ、32bit ARMは未対応です。
-- 初回セットアップは約250 MiB以上をネットワーク取得します。
+- 初回セットアップは約360 MiB以上をネットワーク取得します。
+- Claude Codeの初回ログインと利用には、対応するAnthropicアカウントとインターネット接続が必要です。
+- OmochiはClaude Codeを導入して起動可能にしますが、Anthropicへの認証や有料プラン契約を自動化しません。
+- Claude Codeはワークスペースの読書きやコマンド実行が可能です。提示された変更と許可要求を確認してください。
+- 日本語Language Packが翻訳しない設定識別子・製品名・新規上流機能は英語のまま表示される場合があります。
 - Android WebView上のCode - OSSなので、Electron固有の複数ネイティブウィンドウ等はありません。
 - サーバープロセスは現在アプリプロセス管理です。ワークベンチを閉じた後の常駐実行は保証しません。
 - Androidの省メモリ処理、画面回転、長時間バックグラウンド、巨大リポジトリは実機検証が必要です。
@@ -214,5 +234,8 @@ APKに含まれる第三者コンポーネントにはそれぞれのライセ�
 GPL/LGPL対象バイナリの対応ソース、ビルドレシピ、ライセンス本文は
 `app/src/main/assets/legal/` に同梱しています。
 
-OmochiはVisual Studio Code、Microsoft Corporation、Coder Technologies, Inc.と提携していません。
+code-server、日本語Language Pack、Claude CodeはAPKには同梱せず、ユーザーが開始したセットアップで
+各公式配布元から取得します。各配布物にはそれぞれのライセンス・利用条件が適用されます。
+
+OmochiはVisual Studio Code、Microsoft Corporation、Coder Technologies, Inc.、Anthropicと提携していません。
 各名称・商標は各権利者に帰属します。

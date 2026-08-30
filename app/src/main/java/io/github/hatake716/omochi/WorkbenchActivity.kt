@@ -360,7 +360,7 @@ class WorkbenchActivity : ComponentActivity() {
         val script = """
             (() => {
               if (window.__omochiLoginSubmitted) return true;
-              if (!document.body || !document.body.innerText.includes('Omochi local workbench')) return false;
+              if (!document.body || !document.body.innerText.includes('Omochi')) return false;
               const input = document.querySelector('input[name="password"]');
               const form = document.querySelector('form.login-form');
               if (!input || !form) return false;
@@ -692,7 +692,7 @@ private fun WorkbenchTitleBar(
                 .background(if (state is OmochiServerManager.State.Running) OmochiColors.Green else OmochiColors.Yellow)
         )
         Spacer(Modifier.width(4.dp))
-        ToolbarButton(Icons.Outlined.FolderOpen, "Explorer", onExplorer)
+        ToolbarButton(Icons.Outlined.FolderOpen, "エクスプローラー", onExplorer)
         ToolbarButton(Icons.Outlined.Search, "検索", onSearch)
         ToolbarButton(Icons.Outlined.AccountTree, "Git", onSourceControl)
         ToolbarButton(Icons.Outlined.Terminal, "ターミナル", onTerminal)
@@ -755,12 +755,12 @@ private fun TouchKeyBar(
         KeyButton("↑") { onKey(KeyEvent.KEYCODE_DPAD_UP) }
         KeyButton("↓") { onKey(KeyEvent.KEYCODE_DPAD_DOWN) }
         KeyButton("→") { onKey(KeyEvent.KEYCODE_DPAD_RIGHT) }
-        KeyButton("SAVE") { onShortcut("save") }
-        KeyButton("UNDO") { onShortcut("undo") }
-        KeyButton("REDO") { onShortcut("redo") }
-        KeyButton("FIND") { onShortcut("find") }
-        KeyButton("OPEN") { onShortcut("quickOpen") }
-        KeyButton("TERM+") { onShortcut("newTerminal") }
+        KeyButton("保存") { onShortcut("save") }
+        KeyButton("元に戻す") { onShortcut("undo") }
+        KeyButton("やり直す") { onShortcut("redo") }
+        KeyButton("検索") { onShortcut("find") }
+        KeyButton("開く") { onShortcut("quickOpen") }
+        KeyButton("端末＋") { onShortcut("newTerminal") }
         Surface(
             onClick = onShowIme,
             color = OmochiColors.Accent,

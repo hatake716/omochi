@@ -58,4 +58,35 @@ class OmochiRuntimeTest {
         assertEquals("http://127.0.0.1:54321/?folder=/workspace", OmochiRuntime.serverUrl(54321))
         assertThrows(IllegalArgumentException::class.java) { OmochiRuntime.serverUrl(80) }
     }
+
+    @Test
+    fun languagePackHashMatchesVsCodeCacheAlgorithm() {
+        assertEquals(
+            "5cc3bef61c1e4b1db1f6c78dc4120a56",
+            OmochiRuntime.languagePackHash(
+                "ms-ceintl.vscode-language-pack-ja",
+                "1.131.2026082318",
+            ),
+        )
+    }
+
+    @Test
+    fun markerParserIgnoresCommentsAndMalformedRows() {
+        assertEquals(
+            mapOf(
+                "schema" to "2",
+                "locale" to "ja",
+                "value" to "left=right",
+            ),
+            OmochiRuntime.markerValues(
+                """
+                # Omochi marker
+                schema=2
+                malformed
+                locale=ja
+                value=left=right
+                """.trimIndent(),
+            ),
+        )
+    }
 }

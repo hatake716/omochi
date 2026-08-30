@@ -22,3 +22,15 @@ bundled at legal/licenses/COMMONS-COMPRESS-NOTICE.txt.
 code-server is not bundled in the APK. Omochi downloads the pinned official
 standalone archive from coder/code-server during user-initiated setup. Its own
 licenses and notices remain in the downloaded distribution.
+
+The Microsoft Japanese Language Pack for Visual Studio Code is not bundled in
+the APK. Omochi downloads a pinned official VSIX during user-initiated setup,
+verifies its SHA-256, and installs it only as a display-language resource. The
+language pack is provided under the MIT License; its license and third-party
+notices remain in the downloaded extension directory.
+
+Claude Code is not bundled in the APK. Omochi verifies Anthropic's published
+APT signing-key fingerprint and installs Claude Code from Anthropic's signed
+stable Debian/Ubuntu repository during user-initiated setup. Claude Code is an
+Anthropic product and is subject to Anthropic's applicable terms and account
+requirements.

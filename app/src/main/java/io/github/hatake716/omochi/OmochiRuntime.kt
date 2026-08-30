@@ -9,6 +9,7 @@ import android.util.Base64
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.File
@@ -36,7 +37,20 @@ object OmochiRuntime {
     private const val STATE_FILE = "active-container"
     private const val INSTALL_MARKER = ".omochi-rootfs"
     private const val IDE_MARKER = ".omochi-code-server"
+    private const val EXPERIENCE_MARKER = ".omochi-japanese-claude-v1"
+    private const val EXPERIENCE_SCHEMA = "2"
     private const val AUTH_FILE = "code-server-password"
+    private const val JAPANESE_LANGUAGE_PACK_ID =
+        "ms-ceintl.vscode-language-pack-ja"
+    private const val OMOCHI_USER_DATA_GUEST = "/root/.local/share/omochi"
+    private const val OMOCHI_EXTENSIONS_GUEST = "$OMOCHI_USER_DATA_GUEST/extensions"
+    private const val CLAUDE_CODE_KEY_URL =
+        "https://downloads.claude.ai/keys/claude-code.asc"
+    private const val CLAUDE_CODE_KEY_FINGERPRINT =
+        "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
+    private const val CLAUDE_CODE_APT_SOURCE =
+        "deb [signed-by=/etc/apt/keyrings/claude-code.asc] " +
+            "https://downloads.claude.ai/claude-code/apt/stable stable main"
     private val authLock = Any()
 
     data class LaunchSpec(
@@ -311,6 +325,33 @@ object OmochiRuntime {
             ?.substringAfter('=')
     }
 
+    fun isJapaneseClaudeInstalled(context: Context): Boolean {
+        val rootfs = rootfsDir(context, DEFAULT_CONTAINER)
+        val marker = markerValues(
+            File(rootfs, "opt/omochi/$EXPERIENCE_MARKER").readTextSafely()
+        )
+        return marker["schema"] == EXPERIENCE_SCHEMA &&
+            marker["locale"] == "ja" &&
+            marker["language_pack_version"] == BuildConfig.VSCODE_JA_LANGUAGE_PACK_VERSION &&
+            !marker["claude_code_version"].isNullOrBlank() &&
+            File(rootfs, "usr/bin/claude").isFile &&
+            hasJapaneseLanguagePack(rootfs)
+    }
+
+    fun installedClaudeCodeVersion(context: Context): String? {
+        val marker = File(
+            rootfsDir(context, DEFAULT_CONTAINER),
+            "opt/omochi/$EXPERIENCE_MARKER"
+        )
+        return markerValues(marker.readTextSafely())["claude_code_version"]
+    }
+
+    internal fun markerValues(value: String): Map<String, String> = value
+        .lineSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() && !it.startsWith('#') && '=' in it }
+        .associate { line -> line.substringBefore('=') to line.substringAfter('=') }
+
     private fun installCodeServer(
         context: Context,
         onProgress: (InstallProgress) -> Unit,
@@ -325,8 +366,34 @@ object OmochiRuntime {
                 ensureHostRuntime(appContext).getOrThrow()
                 check(isLinuxInstalled(appContext)) { "Linuxランタイムがありません。" }
 
+                if (isInstalled(appContext) && isJapaneseClaudeInstalled(appContext)) {
+                    progress(
+                        InstallProgress(
+                            "complete",
+                            "日本語ワークベンチとClaude Codeはセットアップ済みです。",
+                            100
+                        )
+                    )
+                    return@runCatching Unit
+                }
+
                 if (isInstalled(appContext)) {
-                    progress(InstallProgress("complete", "IDEはセットアップ済みです。", 100))
+                    progress(
+                        InstallProgress(
+                            "upgrade",
+                            "IDEサーバーを停止して追加セットアップを開始します…",
+                            55
+                        )
+                    )
+                    OmochiServerManager.stop()
+                    installJapaneseAndClaude(appContext, ::progress)
+                    progress(
+                        InstallProgress(
+                            "complete",
+                            "日本語ワークベンチとClaude Codeの準備が完了しました。",
+                            100
+                        )
+                    )
                     return@runCatching Unit
                 }
 
@@ -420,7 +487,7 @@ object OmochiRuntime {
                     apt-get -o Acquire::Retries=3 update
                     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
                       bash ca-certificates git openssh-client ripgrep curl wget \
-                      zip unzip xz-utils locales libstdc++6 libatomic1
+                      zip unzip xz-utils locales libstdc++6 libatomic1 gnupg
                     apt-get clean
                     rm -rf /var/lib/apt/lists/*
                 """.trimIndent()
@@ -440,11 +507,13 @@ object OmochiRuntime {
                         packageResult.output.takeLast(2_000)
                 }
 
-                progress(InstallProgress("configure", "タッチUIとmacOS風テーマを構成しています…", 92))
+                progress(InstallProgress("configure", "タッチUIとmacOS風テーマを構成しています…", 88))
                 configureCodeServer(appContext)
                 createWelcomeFile(appContext)
 
-                progress(InstallProgress("self-test", "Code - OSSエンジンを検証しています…", 97))
+                installJapaneseAndClaude(appContext, ::progress)
+
+                progress(InstallProgress("self-test", "Code - OSSエンジンを検証しています…", 99))
                 val testResult = runGuestCommandSync(
                     context = appContext,
                     command = "${serverGuestBinary()} --version",
@@ -461,7 +530,13 @@ object OmochiRuntime {
                         "installed=${System.currentTimeMillis()}\n" +
                         "self_test=ok\n"
                 )
-                progress(InstallProgress("complete", "Omochiのセットアップが完了しました。", 100))
+                progress(
+                    InstallProgress(
+                        "complete",
+                        "日本語ワークベンチとClaude Codeを含むセットアップが完了しました。",
+                        100
+                    )
+                )
                 Unit
             }
             main.post { onComplete(result) }
@@ -498,8 +573,9 @@ object OmochiRuntime {
             "--disable-telemetry",
             "--disable-update-check",
             "--disable-getting-started-override",
+            "--locale", "ja",
             "--app-name", "Omochi",
-            "--welcome-text", "Omochi local workbench",
+            "--welcome-text", "Omochi ローカルワークベンチ",
             "--user-data-dir", "/root/.local/share/omochi",
             "--extensions-dir", "/root/.local/share/omochi/extensions",
             "/workspace"
@@ -556,6 +632,291 @@ object OmochiRuntime {
 
     private fun serverGuestBinary(): String =
         "/opt/omochi/code-server-${BuildConfig.CODE_SERVER_VERSION}-linux-arm64/bin/code-server"
+
+    private fun findJapaneseLanguagePack(rootfs: File): File? {
+        val extensions = File(rootfs, "root/.local/share/omochi/extensions")
+        return extensions.listFiles().orEmpty().firstOrNull { directory ->
+            if (!directory.isDirectory) return@firstOrNull false
+            val manifest = File(directory, "package.json")
+            runCatching {
+                val json = JSONObject(manifest.readText())
+                json.optString("publisher").equals("MS-CEINTL", ignoreCase = true) &&
+                    json.optString("name") == "vscode-language-pack-ja" &&
+                    json.optString("version") == BuildConfig.VSCODE_JA_LANGUAGE_PACK_VERSION
+            }.getOrDefault(false)
+        }
+    }
+
+    private fun hasJapaneseLanguagePack(rootfs: File): Boolean {
+        val extension = findJapaneseLanguagePack(rootfs) ?: return false
+        val mainTranslation = File(extension, "translations/main.i18n.json")
+        if (!mainTranslation.isFile) return false
+
+        val languagePacks = File(rootfs, "root/.local/share/omochi/languagepacks.json")
+        return runCatching {
+            val japanese = JSONObject(languagePacks.readText()).getJSONObject("ja")
+            val expectedPath = "$OMOCHI_EXTENSIONS_GUEST/${extension.name}/translations/main.i18n.json"
+            japanese.getString("hash") == languagePackHash(
+                JAPANESE_LANGUAGE_PACK_ID,
+                BuildConfig.VSCODE_JA_LANGUAGE_PACK_VERSION,
+            ) && japanese.getJSONObject("translations").getString("vscode") == expectedPath
+        }.getOrDefault(false)
+    }
+
+    /**
+     * code-server's command-line installer extracts a language pack but does not
+     * instantiate VS Code's language-pack cache participant.  The web workbench
+     * resolves translations before extensions start, so generate the same
+     * userData/languagepacks.json index that VS Code's NativeLanguagePackService
+     * normally writes during an interactive extension install.
+     */
+    private fun configureJapaneseLanguagePack(rootfs: File) {
+        val extension = findJapaneseLanguagePack(rootfs)
+            ?: error("導入済み日本語Language Packの展開先を確認できません。")
+        val manifest = JSONObject(File(extension, "package.json").readText())
+        val localizations = manifest
+            .getJSONObject("contributes")
+            .getJSONArray("localizations")
+        val japanese = (0 until localizations.length())
+            .map { localizations.getJSONObject(it) }
+            .firstOrNull { it.optString("languageId") == "ja" }
+            ?: error("日本語Language Packにjaローカライズ定義がありません。")
+
+        val extensionRoot = extension.canonicalFile
+        val translations = JSONObject()
+        val contributedTranslations = japanese.getJSONArray("translations")
+        for (index in 0 until contributedTranslations.length()) {
+            val contribution = contributedTranslations.getJSONObject(index)
+            val id = contribution.getString("id")
+            val relative = contribution.getString("path")
+                .replace('\\', '/')
+                .removePrefix("./")
+            val hostFile = File(extensionRoot, relative).canonicalFile
+            check(
+                hostFile.path.startsWith(extensionRoot.path + File.separator) &&
+                    hostFile.isFile
+            ) {
+                "日本語Language Packの翻訳ファイルが不正です: $relative"
+            }
+            translations.put(id, "$OMOCHI_EXTENSIONS_GUEST/${extension.name}/$relative")
+        }
+        check(translations.has("vscode")) {
+            "日本語Language PackにCode - OSS本体の翻訳がありません。"
+        }
+
+        val hash = languagePackHash(
+            JAPANESE_LANGUAGE_PACK_ID,
+            BuildConfig.VSCODE_JA_LANGUAGE_PACK_VERSION,
+        )
+        val languagePack = JSONObject()
+            .put("hash", hash)
+            .put(
+                "label",
+                japanese.optString("localizedLanguageName")
+                    .ifBlank { japanese.optString("languageName", "日本語") },
+            )
+            .put(
+                "extensions",
+                JSONArray().put(
+                    JSONObject()
+                        .put(
+                            "extensionIdentifier",
+                            JSONObject().put("id", JAPANESE_LANGUAGE_PACK_ID),
+                        )
+                        .put("version", BuildConfig.VSCODE_JA_LANGUAGE_PACK_VERSION),
+                ),
+            )
+            .put("translations", translations)
+
+        val userData = File(rootfs, "root/.local/share/omochi").apply { mkdirs() }
+        val cache = File(userData, "clp/$hash.ja")
+        if (cache.exists()) {
+            check(cache.deleteRecursively()) {
+                "以前の日本語UIキャッシュを更新できませんでした。"
+            }
+        }
+        val destination = File(userData, "languagepacks.json")
+        val temporary = File(userData, "languagepacks.json.part")
+        temporary.writeText(JSONObject().put("ja", languagePack).toString(2) + "\n")
+        Files.move(
+            temporary.toPath(),
+            destination.toPath(),
+            StandardCopyOption.REPLACE_EXISTING,
+        )
+    }
+
+    internal fun languagePackHash(identifier: String, version: String): String =
+        MessageDigest.getInstance("MD5")
+            .digest("$identifier$version".toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    private fun installJapaneseAndClaude(
+        context: Context,
+        progress: (InstallProgress) -> Unit,
+    ) {
+        val rootfs = rootfsDir(context, DEFAULT_CONTAINER)
+        val opt = File(rootfs, "opt/omochi").apply { mkdirs() }
+        check(serverHostBinary(context).isFile) {
+            "日本語Language Packを導入するCode - OSSエンジンがありません。"
+        }
+
+        val vsixName =
+            "vscode-language-pack-ja-${BuildConfig.VSCODE_JA_LANGUAGE_PACK_VERSION}.vsix"
+        val cachedVsix = File(cacheDir(context), vsixName)
+        if (!cachedVsix.isFile || !hasExpectedSha256(
+                cachedVsix,
+                BuildConfig.VSCODE_JA_LANGUAGE_PACK_SHA256,
+            )
+        ) {
+            cachedVsix.delete()
+            progress(InstallProgress("ja-download", "日本語UIを取得しています…", 89))
+            downloadWithRetry(
+                url = BuildConfig.VSCODE_JA_LANGUAGE_PACK_URL,
+                destination = cachedVsix,
+                minimumBytes = 500_000L,
+                onAttempt = { attempt ->
+                    if (attempt > 1) {
+                        progress(
+                            InstallProgress(
+                                "ja-download",
+                                "日本語UIの取得を再試行しています ($attempt/3)…",
+                                89,
+                            )
+                        )
+                    }
+                },
+                onBytes = { current, total ->
+                    val message = if (total > 0) {
+                        "日本語UIを取得中… %.1f / %.1f KiB".format(
+                            current / 1024.0,
+                            total / 1024.0,
+                        )
+                    } else {
+                        "日本語UIを取得中… %.1f KiB".format(current / 1024.0)
+                    }
+                    progress(InstallProgress("ja-download", message, 90))
+                },
+            )
+        } else {
+            progress(InstallProgress("ja-download", "検証済み日本語UIを使用します。", 90))
+        }
+        check(hasExpectedSha256(cachedVsix, BuildConfig.VSCODE_JA_LANGUAGE_PACK_SHA256)) {
+            "日本語Language PackのSHA-256が一致しません。"
+        }
+
+        progress(InstallProgress("ja-install", "設定・メニューの日本語表示を構成しています…", 91))
+        val guestVsix = File(opt, vsixName)
+        cachedVsix.copyTo(guestVsix, overwrite = true)
+        try {
+            val installResult = runGuestCommandSync(
+                context = context,
+                command = "${serverGuestBinary()} " +
+                    "--user-data-dir /root/.local/share/omochi " +
+                    "--extensions-dir /root/.local/share/omochi/extensions " +
+                    "--install-extension /opt/omochi/$vsixName --force",
+                timeoutSeconds = 180,
+            )
+            check(installResult.exitCode == 0) {
+                "日本語Language Packの導入に失敗しました (exit=${installResult.exitCode}): " +
+                    installResult.output.takeLast(2_000)
+            }
+        } finally {
+            guestVsix.delete()
+        }
+
+        val listResult = runGuestCommandSync(
+            context = context,
+            command = "${serverGuestBinary()} " +
+                "--user-data-dir /root/.local/share/omochi " +
+                "--extensions-dir /root/.local/share/omochi/extensions " +
+                "--list-extensions --show-versions",
+            timeoutSeconds = 60,
+        )
+        val expectedLanguagePack =
+            "ms-ceintl.vscode-language-pack-ja@${BuildConfig.VSCODE_JA_LANGUAGE_PACK_VERSION}"
+        check(
+            listResult.exitCode == 0 &&
+                listResult.output.lineSequence().any {
+                    it.trim().equals(expectedLanguagePack, ignoreCase = true)
+                }
+        ) {
+            "日本語Language PackをCode - OSSが認識できません: " +
+                listResult.output.takeLast(2_000)
+        }
+
+        configureJapaneseLanguagePack(rootfs)
+        check(hasJapaneseLanguagePack(rootfs)) {
+            "日本語Language Packの起動前インデックスを作成できませんでした。"
+        }
+
+        val userDir = File(rootfs, "root/.local/share/omochi/User").apply { mkdirs() }
+        val argvFile = File(userDir, "argv.json")
+        val argv = runCatching { JSONObject(argvFile.readTextSafely()) }.getOrElse { JSONObject() }
+        argv.put("locale", "ja")
+        argvFile.writeText(argv.toString(2) + "\n")
+
+        progress(InstallProgress("claude-install", "Claude Code公式署名鍵を確認しています…", 93))
+        val claudeCommand = """
+            set -eu
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -o Acquire::Retries=3 update
+            apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+              ca-certificates curl gnupg
+            install -d -m 0755 /etc/apt/keyrings
+            curl -fsSL '${CLAUDE_CODE_KEY_URL}' -o /etc/apt/keyrings/claude-code.asc
+            gpg --batch --show-keys --with-colons /etc/apt/keyrings/claude-code.asc \
+              | grep -Fqx 'fpr:::::::::${CLAUDE_CODE_KEY_FINGERPRINT}:'
+            printf '%s\n' '${CLAUDE_CODE_APT_SOURCE}' \
+              > /etc/apt/sources.list.d/claude-code.list
+            apt-get -o Acquire::Retries=3 update
+            apt-get -o Acquire::Retries=3 install -y --no-install-recommends claude-code
+            apt-get clean
+            rm -rf /var/lib/apt/lists/*
+        """.trimIndent()
+        val claudeInstall = runGuestCommandSync(
+            context = context,
+            command = claudeCommand,
+            timeoutSeconds = 1_200,
+            onLine = { line ->
+                val compact = line.trim().take(160)
+                if (compact.isNotEmpty()) {
+                    progress(InstallProgress("claude-install", compact, 96))
+                }
+            },
+        )
+        check(claudeInstall.exitCode == 0) {
+            "Claude Codeの導入に失敗しました (exit=${claudeInstall.exitCode}): " +
+                claudeInstall.output.takeLast(2_000)
+        }
+
+        progress(InstallProgress("claude-test", "Claude Codeを実行して確認しています…", 98))
+        val claudeTest = runGuestCommandSync(
+            context = context,
+            command = "claude --version",
+            timeoutSeconds = 120,
+        )
+        check(claudeTest.exitCode == 0) {
+            "Claude Codeセルフテストに失敗しました (exit=${claudeTest.exitCode}): " +
+                claudeTest.output.takeLast(2_000)
+        }
+        val claudeVersion = Regex("""\d+\.\d+\.\d+""")
+            .find(claudeTest.output)
+            ?.value
+            ?: error("Claude Codeのバージョンを確認できません: ${claudeTest.output.take(500)}")
+
+        createClaudeGuideFile(context)
+        File(opt, EXPERIENCE_MARKER).writeText(
+            "schema=$EXPERIENCE_SCHEMA\n" +
+                "locale=ja\n" +
+                "language_pack_version=${BuildConfig.VSCODE_JA_LANGUAGE_PACK_VERSION}\n" +
+                "language_pack_sha256=${BuildConfig.VSCODE_JA_LANGUAGE_PACK_SHA256}\n" +
+                "claude_code_version=$claudeVersion\n" +
+                "claude_code_channel=stable\n" +
+                "claude_signing_key_fingerprint=$CLAUDE_CODE_KEY_FINGERPRINT\n" +
+                "installed=${System.currentTimeMillis()}\n" +
+                "self_test=ok\n"
+        )
+    }
 
     private fun configureCodeServer(context: Context) {
         val rootfs = rootfsDir(context, DEFAULT_CONTAINER)
@@ -644,9 +1005,42 @@ object OmochiRuntime {
                 - `>_` で統合ターミナルを開けます。
                 - 画面下のタッチキーバーから Esc / Ctrl / Alt / Tab / 矢印を送れます。
                 - Git clone、ステージ、コミット、ブランチ操作はSource Controlから利用できます。
+                - 統合ターミナルで `claude` を実行するとClaude Codeを開始できます。
 
-                外部拡張マーケットは無効です。言語処理系やビルドツールは統合ターミナルから
-                Ubuntu環境へ導入してください。
+                設定・メニューは日本語Language Packで表示します。外部拡張マーケットは無効です。
+                言語処理系やビルドツールは統合ターミナルからUbuntu環境へ導入してください。
+                """.trimIndent() + "\n"
+            )
+        }
+    }
+
+    private fun createClaudeGuideFile(context: Context) {
+        val workspace = workspaceDir(context).apply { mkdirs() }
+        val guide = File(workspace, "Claude Codeを使う.md")
+        if (!guide.exists()) {
+            guide.writeText(
+                """
+                # Claude Codeを使う
+
+                Omochiの統合ターミナルを開き、プロジェクトのフォルダで次を実行します。
+
+                ```bash
+                claude
+                ```
+
+                初回だけAnthropicアカウントでの認証が必要です。表示された案内に従って、
+                Claude Pro / Max / Team / Enterprise またはAnthropic Consoleのアカウントで
+                ログインしてください。無料のClaude.aiプランだけではClaude Codeを利用できません。
+
+                バージョン確認:
+
+                ```bash
+                claude --version
+                ```
+
+                Claude CodeはOmochiのUbuntu環境内で動作し、現在開いているプロジェクトの
+                ファイルを読み書きできます。実行を許可するコマンドと変更内容を確認してから
+                承認してください。
                 """.trimIndent() + "\n"
             )
         }
@@ -848,6 +1242,7 @@ object OmochiRuntime {
     private fun downloadWithRetry(
         url: String,
         destination: File,
+        minimumBytes: Long = 20_000_000L,
         onAttempt: (Int) -> Unit,
         onBytes: (Long, Long) -> Unit
     ) {
@@ -855,7 +1250,7 @@ object OmochiRuntime {
         for (attempt in 1..3) {
             onAttempt(attempt)
             try {
-                downloadTo(url, destination, onBytes)
+                downloadTo(url, destination, minimumBytes, onBytes)
                 return
             } catch (t: Throwable) {
                 lastError = t
@@ -872,6 +1267,7 @@ object OmochiRuntime {
     private fun downloadTo(
         url: String,
         destination: File,
+        minimumBytes: Long,
         progress: (Long, Long) -> Unit
     ) {
         destination.parentFile?.mkdirs()
@@ -909,8 +1305,8 @@ object OmochiRuntime {
                 }
             }
             progress(written, total)
-            check(written > 20_000_000L) {
-                "Linux Baseのダウンロードサイズが不正です (${written} bytes)。"
+            check(written >= minimumBytes) {
+                "ダウンロードサイズが不正です (${written} bytes、最低${minimumBytes} bytes)。"
             }
             Files.move(
                 temp.toPath(),

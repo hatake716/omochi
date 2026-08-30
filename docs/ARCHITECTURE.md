@@ -49,8 +49,10 @@ files/embedded-runtime/containers/omochi-linux/rootfs/
 ```
 
 The rootfs is configured with `/dev`, `/proc`, and `/sys` binds. The app-private workspace is bound at
-`/workspace`. Setup installs only the common host tools needed by the core workbench: Bash, CA certificates,
-Git, OpenSSH client, ripgrep, curl/wget, archive utilities, locales, libstdc++, and libatomic.
+`/workspace`. Setup installs the common host tools needed by the core workbench: Bash, CA certificates,
+Git, OpenSSH client, ripgrep, curl/wget, archive utilities, locales, libstdc++, libatomic, and GnuPG.
+It also registers Anthropic's signed stable APT repository after checking the complete signing-key fingerprint,
+then installs Claude Code into this private Ubuntu environment.
 
 Language compilers and project SDKs are not silently installed. They belong to the selected project and can
 be installed through the integrated terminal.
@@ -70,9 +72,15 @@ Omochi starts it with these important properties:
 - telemetry and update checks disabled;
 - Code - OSS Workspace Trust left enabled;
 - user data `/root/.local/share/omochi`;
-- empty external extension directory;
+- locale `ja` plus a product-managed Microsoft Japanese Language Pack in the user extension directory;
 - `EXTENSIONS_GALLERY={}` plus removal of `extensionsGallery` from `product.json`;
 - startup folder `/workspace`.
+
+The code-server CLI extracts the language-pack VSIX but does not create VS Code's pre-start localization
+cache in this headless installation path. Omochi validates every declared translation path, writes the same
+`languagepacks.json` index used by `NativeLanguagePackService`, and lets code-server generate its commit-scoped
+`clp/<hash>.ja/.../nls.messages.js` before serving the workbench. This makes core menus and Settings Japanese
+without enabling an extension marketplace.
 
 The WebView communicates through HTTP and WebSocket. It allows only the exact active loopback host/port to
 stay inside the app; HTTP(S) and mail links to other hosts are handed to Android. On the branded local login
@@ -89,11 +97,17 @@ page, Android injects the private password and submits the form so the user neve
 7. Remove only the exact old version directory, then extract into `/opt/omochi`.
 8. Install common Linux tools.
 9. Remove the external extension gallery and write default user settings.
-10. Execute `code-server --version` inside PRoot.
-11. Create `.omochi-code-server` only after every prior gate passes.
+10. Download the pinned official Japanese Language Pack VSIX and verify its SHA-256.
+11. Install the pack, validate its manifest paths, generate `languagepacks.json`, and select locale `ja`.
+12. Verify Anthropic's full signing-key fingerprint, register its stable APT source, and install Claude Code.
+13. Execute `claude --version` and `code-server --version` inside PRoot.
+14. Create the IDE and Japanese/Claude completion markers only after their respective gates pass.
 
 An interrupted download does not become the cache. An interrupted extraction has no IDE marker and is
 replaced on the next attempt.
+
+Existing v0.1 installations use a non-destructive migration: Omochi stops only its IDE server, preserves the
+rootfs and `/workspace`, adds the Japanese UI and Claude Code, verifies both, and then writes the new marker.
 
 ## 4. Runtime lifecycle
 
@@ -143,12 +157,19 @@ Extensions Activity without changing the workbench's file/editor layout engine.
 - Third-party cookies and web permission requests are denied.
 - The server never binds `0.0.0.0`.
 - The setup archive uses an official HTTPS URL and exact SHA-256.
+- The Japanese VSIX uses an official Microsoft asset URL, exact SHA-256, and contained translation paths.
+- Claude's APT source is enabled only after the downloaded signing key matches
+  `31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE`.
 - Tar output paths are canonicalized and constrained under the selected extraction root.
 - External links are not loaded with the privileged local workbench origin.
 - No credentials are embedded in source or APK.
 
 Git credentials entered inside the Linux environment remain in the app-private rootfs. The project does not
 yet provide Android Keystore-backed Git credential storage.
+
+Claude Code authentication is separate from Omochi's loopback password. Omochi does not embed Anthropic
+credentials or bypass login. Claude Code can read and modify the selected workspace and run approved guest
+commands, so its prompts and permission requests are part of the user's trust boundary.
 
 Network Security Config does not sandbox sockets opened by guest Git, apt, terminals, tasks, or debugged
 programs. Those processes can use the app's Android `INTERNET` permission. Untrusted project commands must be
@@ -165,6 +186,11 @@ For a code-server update:
 5. Compare the tagged `src/node/cli.ts` against every launch flag.
 6. Run unit tests, lint, APK build, archive-content checks, then the full ARM64 device setup.
 7. Check that the gallery remains absent and built-in Git/terminal still work.
+
+For a Japanese Language Pack update, select a version compatible with the pinned Code engine, verify the
+official VSIX publisher/name/version, update the exact SHA-256, and repeat the Japanese Settings and command
+palette device checks. For Claude Code, re-check Anthropic's official install documentation and signing-key
+fingerprint before changing the repository/channel contract.
 
 For PRoot or support-library updates, regenerate the binary with the included source/build material, replace
 the corresponding source offer, refresh `SOURCE-AND-LICENSE-MANIFEST.sha256`, and verify 16 KiB page-size

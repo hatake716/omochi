@@ -116,6 +116,14 @@ private fun LegalScreen(
                         "code-server ${BuildConfig.CODE_SERVER_VERSION}",
                         "初回セットアップ時に公式配布物をSHA-256検証して取得",
                     )
+                    ComponentLine(
+                        "Microsoft 日本語Language Pack ${BuildConfig.VSCODE_JA_LANGUAGE_PACK_VERSION}",
+                        "MIT License・公式VSIXをSHA-256検証して取得",
+                    )
+                    ComponentLine(
+                        "Claude Code",
+                        "Anthropic公式の署名済みstable aptリポジトリから取得",
+                    )
                 }
             }
 
@@ -150,10 +158,33 @@ private fun LegalScreen(
                 Spacer(Modifier.width(8.dp))
                 Text("code-server公式ソース")
             }
+            OutlinedButton(
+                onClick = {
+                    onOpen(
+                        "https://github.com/microsoft/vscode-loc/" +
+                            "tree/main/i18n/vscode-language-pack-ja"
+                    )
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("日本語Language Pack公式ソース")
+            }
+            OutlinedButton(
+                onClick = { onOpen("https://code.claude.com/docs/ja/overview") },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Claude Code公式ドキュメント")
+            }
 
             Text(
-                "OmochiはVisual Studio Code、Microsoft Corporation、Coder Technologies, Inc.と" +
-                    "提携・承認関係にありません。Visual Studio Code名称は説明目的でのみ使用しています。",
+                "OmochiはVisual Studio Code、Microsoft Corporation、Coder Technologies, Inc.、" +
+                    "Anthropicと提携・承認関係にありません。Claude CodeはAnthropicの製品であり、" +
+                    "利用にはAnthropicの利用条件と対応アカウントが適用されます。" +
+                    "各名称は説明目的でのみ使用しています。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = OmochiColors.Muted,
                 modifier = Modifier.padding(vertical = 8.dp),

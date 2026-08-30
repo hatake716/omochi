@@ -69,6 +69,8 @@ import androidx.compose.ui.unit.dp
 
 class MainActivity : ComponentActivity() {
     private var installed by mutableStateOf(false)
+    private var japaneseClaudeInstalled by mutableStateOf(false)
+    private var claudeCodeVersion by mutableStateOf<String?>(null)
     private var setupRunning by mutableStateOf(false)
     private var setupPercent by mutableIntStateOf(0)
     private var setupMessage by mutableStateOf("未セットアップ")
@@ -102,16 +104,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        installed = OmochiRuntime.isInstalled(this)
-        setupMessage = if (installed) {
-            "Code ${OmochiRuntime.installedVersion(this) ?: BuildConfig.CODE_SERVER_VERSION} を利用できます"
-        } else {
-            "LinuxランタイムとIDEエンジンを端末内へ準備します"
-        }
+        refreshRuntimeState()
         setContent {
             OmochiTheme {
                 HomeScreen(
                     installed = installed,
+                    japaneseClaudeInstalled = japaneseClaudeInstalled,
+                    claudeCodeVersion = claudeCodeVersion,
                     supported = OmochiRuntime.isSupportedAbi(),
                     setupRunning = setupRunning,
                     setupPercent = setupPercent,
@@ -131,7 +130,22 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (!setupRunning) refreshRuntimeState()
+    }
+
+    private fun refreshRuntimeState() {
         installed = OmochiRuntime.isInstalled(this)
+        japaneseClaudeInstalled = OmochiRuntime.isJapaneseClaudeInstalled(this)
+        claudeCodeVersion = OmochiRuntime.installedClaudeCodeVersion(this)
+        setupMessage = when {
+            installed && japaneseClaudeInstalled -> {
+                val code = OmochiRuntime.installedVersion(this) ?: BuildConfig.CODE_SERVER_VERSION
+                val claude = claudeCodeVersion ?: "導入済み"
+                "code-server $code・日本語UI・Claude Code $claude を利用できます"
+            }
+            installed -> "日本語UIとClaude Codeの追加セットアップが必要です"
+            else -> "Linuxランタイム、IDE、日本語UI、Claude Codeを端末内へ準備します"
+        }
     }
 
     private fun startSetup() {
@@ -148,11 +162,13 @@ class MainActivity : ComponentActivity() {
             onComplete = { result ->
                 setupRunning = false
                 result.onSuccess {
-                    installed = true
+                    refreshRuntimeState()
                     setupPercent = 100
-                    setupMessage = "セットアップ完了。ワークベンチを開けます。"
+                    setupMessage = "セットアップ完了。日本語ワークベンチを開けます。"
                 }.onFailure {
                     installed = OmochiRuntime.isInstalled(this)
+                    japaneseClaudeInstalled = OmochiRuntime.isJapaneseClaudeInstalled(this)
+                    claudeCodeVersion = OmochiRuntime.installedClaudeCodeVersion(this)
                     setupMessage = "セットアップ失敗: ${it.message ?: it.javaClass.simpleName}"
                 }
             }
@@ -241,6 +257,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun HomeScreen(
     installed: Boolean,
+    japaneseClaudeInstalled: Boolean,
+    claudeCodeVersion: String?,
     supported: Boolean,
     setupRunning: Boolean,
     setupPercent: Int,
@@ -297,11 +315,15 @@ private fun HomeScreen(
                     StatusPill("root不要", Color(0xFFDDE9F5))
                     StatusPill("端末内127.0.0.1", Color(0xFFDDEEDC))
                     StatusPill("外部拡張なし", Color(0xFFE7E2F1))
+                    StatusPill("日本語UI", Color(0xFFFFE7C2))
+                    StatusPill("Claude Code", Color(0xFFE8E0F4))
                 }
             }
 
             SetupCard(
                 installed = installed,
+                japaneseClaudeInstalled = japaneseClaudeInstalled,
+                claudeCodeVersion = claudeCodeVersion,
                 supported = supported,
                 running = setupRunning,
                 percent = setupPercent,
@@ -337,8 +359,9 @@ private fun HomeScreen(
                     Column(modifier = Modifier.weight(1f).padding(horizontal = 14.dp)) {
                         Text("ライセンスと実行境界", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            "Code - OSSエンジンは初回セットアップ時に公式配布物を取得します。" +
-                                "PRootの対応ソースと第三者ライセンスはAPKに同梱しています。",
+                            "Code - OSS、日本語Language Pack、Claude Codeはセットアップ時に" +
+                                "公式配布元から検証して取得します。PRootの対応ソースと" +
+                                "第三者ライセンスはAPKに同梱しています。",
                             style = MaterialTheme.typography.bodyMedium,
                             color = OmochiColors.Muted,
                         )
@@ -351,7 +374,8 @@ private fun HomeScreen(
 
             Text(
                 text = "OmochiはVisual Studio Code、Microsoft、Coderとは提携していません。" +
-                    "初回セットアップには約260 MiBのダウンロードと、展開・ツール用の追加容量が必要です。",
+                    "初回セットアップには約360 MiB以上のダウンロードと、" +
+                    "展開・開発ツール用の追加容量が必要です。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = OmochiColors.Muted,
                 textAlign = TextAlign.Center,
@@ -378,7 +402,7 @@ private fun MacHeader() {
         Spacer(Modifier.width(8.dp))
         TrafficDot(OmochiColors.Green)
         Text(
-            text = "Omochi — Welcome",
+            text = "Omochi — ようこそ",
             style = MaterialTheme.typography.labelLarge,
             color = OmochiColors.Muted,
             textAlign = TextAlign.Center,
@@ -415,6 +439,8 @@ private fun StatusPill(text: String, color: Color) {
 @Composable
 private fun SetupCard(
     installed: Boolean,
+    japaneseClaudeInstalled: Boolean,
+    claudeCodeVersion: String?,
     supported: Boolean,
     running: Boolean,
     percent: Int,
@@ -446,10 +472,23 @@ private fun SetupCard(
                 }
                 Column(Modifier.weight(1f).padding(start = 14.dp)) {
                     Text(
-                        if (installed) "ワークベンチ準備完了" else "初回セットアップ",
+                        when {
+                            running && installed -> "追加セットアップ中"
+                            running -> "初回セットアップ中"
+                            installed && japaneseClaudeInstalled -> "ワークベンチ準備完了"
+                            installed -> "追加セットアップ"
+                            else -> "初回セットアップ"
+                        },
                         style = MaterialTheme.typography.titleLarge,
                     )
                     Text(message, style = MaterialTheme.typography.bodyMedium, color = OmochiColors.Muted)
+                    if (japaneseClaudeInstalled) {
+                        Text(
+                            "Claude Code ${claudeCodeVersion ?: "導入済み"}・日本語UI",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Color(0xFF27833B),
+                        )
+                    }
                 }
             }
 
@@ -471,7 +510,22 @@ private fun SetupCard(
                 Text("$percent%", style = MaterialTheme.typography.labelLarge, color = OmochiColors.Muted)
             }
 
-            if (installed) {
+            if (running) {
+                Button(
+                    onClick = {},
+                    enabled = false,
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        color = Color.White,
+                        strokeWidth = 2.dp,
+                    )
+                    Spacer(Modifier.width(9.dp))
+                    Text("セットアップ中")
+                }
+            } else if (installed && japaneseClaudeInstalled) {
                 Button(
                     onClick = onOpen,
                     modifier = Modifier.fillMaxWidth().height(52.dp),
@@ -482,24 +536,35 @@ private fun SetupCard(
                     Spacer(Modifier.width(9.dp))
                     Text("ワークベンチを開く")
                 }
+            } else if (installed) {
+                Button(
+                    onClick = onSetup,
+                    enabled = supported,
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = OmochiColors.Accent),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Icon(Icons.Outlined.FileDownload, contentDescription = null)
+                    Spacer(Modifier.width(9.dp))
+                    Text("日本語UIとClaude Codeを導入")
+                }
+                OutlinedButton(
+                    onClick = onOpen,
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text("現在のワークベンチを開く")
+                }
             } else {
                 Button(
                     onClick = onSetup,
-                    enabled = supported && !running,
+                    enabled = supported,
                     modifier = Modifier.fillMaxWidth().height(52.dp),
                     shape = RoundedCornerShape(14.dp),
                 ) {
-                    if (running) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = Color.White,
-                            strokeWidth = 2.dp,
-                        )
-                    } else {
-                        Icon(Icons.Outlined.FileDownload, contentDescription = null)
-                    }
+                    Icon(Icons.Outlined.FileDownload, contentDescription = null)
                     Spacer(Modifier.width(9.dp))
-                    Text(if (running) "セットアップ中" else "IDEをセットアップ")
+                    Text("Omochiをセットアップ")
                 }
             }
         }
@@ -573,11 +638,13 @@ private fun FeatureCard() {
             )
             FeatureRow(Icons.Outlined.Description, "エディタ", "タブ、分割、差分、複数カーソル、補完、折り畳み、検索・置換")
             HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
-            FeatureRow(Icons.Outlined.Search, "Explorer / Search", "作成、移動、削除、全体検索、正規表現、除外設定")
+            FeatureRow(Icons.Outlined.Search, "エクスプローラー／検索", "作成、移動、削除、全体検索、正規表現、除外設定")
             HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
-            FeatureRow(Icons.Outlined.Source, "Git", "clone、差分、ステージ、コミット、ブランチ、pull / push")
+            FeatureRow(Icons.Outlined.Source, "Git", "クローン、差分、ステージ、コミット、ブランチ、プル／プッシュ")
             HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
-            FeatureRow(Icons.Outlined.Terminal, "Terminal / Tasks / Debug", "Ubuntuシェル、複数端末、タスク実行、問題表示、デバッグUI")
+            FeatureRow(Icons.Outlined.Terminal, "ターミナル／タスク／デバッグ", "Ubuntuシェル、複数端末、タスク実行、問題表示、デバッグUI")
+            HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
+            FeatureRow(Icons.Outlined.Code, "Claude Code", "統合ターミナルから起動し、コードの調査・編集・Git操作を支援")
         }
     }
 }

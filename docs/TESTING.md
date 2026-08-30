@@ -17,6 +17,8 @@ The unit suite currently checks:
 - SHA-256 against a known vector and case-insensitive expected values;
 - tar destination containment and traversal rejection;
 - loopback-only server URL;
+- VS Code-compatible language-pack cache hashing;
+- completion-marker parsing, including comments, malformed rows, and values containing `=`;
 - SAF destination-name sanitization and component length;
 - SAF export containment, including direct and nested symlink rejection.
 
@@ -49,9 +51,13 @@ An installed APK is not a successful IDE test. Continue through setup and visibl
 1. If this is a disposable test installation, uninstall only `io.github.hatake716.omochi.debug` first.
 2. Open Omochi manually.
 3. Verify the unsupported-ABI warning is absent.
-4. Tap **IDEをセットアップ**.
-5. Observe Ubuntu download, extraction, PRoot self-test, IDE download, SHA verification, Linux packages, and Code self-test.
+4. Tap **Omochiをセットアップ**.
+5. Observe Ubuntu download, extraction, PRoot self-test, IDE download, SHA verification, Linux packages,
+   Japanese Language Pack verification/indexing, Claude signing-key verification/install, and both self-tests.
 6. Confirm 100% and **ワークベンチを開く**.
+
+For an existing v0.1 installation, use **日本語UIとClaude Codeを導入** and verify that `/workspace`
+contents and Git state remain unchanged after migration.
 
 Use logcat only as supplementary evidence:
 
@@ -92,13 +98,31 @@ pwd
 git --version
 rg --version
 printf '日本語 terminal OK\n'
+claude --version
 ```
 
 Expected architecture is `aarch64` and path is `/workspace`. Clone a disposable repository, edit a file,
 inspect diff, stage, commit with a test identity, create/switch a branch, and inspect history. Do not store
 production credentials in a disposable test environment.
 
-### 6. SAF
+Expected Claude output contains a semantic version and `(Claude Code)`. Running bare `claude` is a separate
+online/account boundary: complete the first login manually with a supported Anthropic account, inspect every
+requested permission, and do not record tokens or private login screens.
+
+### 6. Japanese UI
+
+1. Confirm Explorer, Search, Source Control, command palette, Settings, Workspace Trust, and terminal labels
+   use the official Japanese localization.
+2. Open **基本設定: 設定 (UI) を開く** and verify the search placeholder, tabs, descriptions, and controls.
+3. Restart the app and confirm Japanese remains selected before extension-host startup.
+4. Treat product names, setting identifiers, and newly added untranslated upstream strings as expected
+   fallbacks; do not confuse those with a completely missing language pack.
+
+Internal diagnostic evidence may check that `languagepacks.json`, commit-scoped `nls.messages.json` /
+`nls.messages.js`, and `_VSCODE_NLS_LANGUAGE=ja` exist. Those checks supplement, but do not replace, the
+visible Japanese Settings/workbench check.
+
+### 7. SAF
 
 1. Import two files with the same display name and confirm neither is overwritten.
 2. Import a nested folder containing Unicode names and binary data.
@@ -106,7 +130,7 @@ production credentials in a disposable test environment.
 4. Hash selected binary files before import and after export.
 5. Add a symlink inside `/workspace` and confirm export stops with a clear rejection instead of following it.
 
-### 7. Lifecycle
+### 8. Lifecycle
 
 - portrait ↔ landscape;
 - Android split-screen;

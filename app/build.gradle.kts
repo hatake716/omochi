@@ -95,8 +95,8 @@ android {
         applicationId = "io.github.hatake716.omochi"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -117,6 +117,21 @@ android {
             "String",
             "CODE_SERVER_ARCHIVE_URL",
             "\"https://github.com/coder/code-server/releases/download/v4.133.0/code-server-4.133.0-linux-arm64.tar.gz\"",
+        )
+        buildConfigField(
+            "String",
+            "VSCODE_JA_LANGUAGE_PACK_VERSION",
+            "\"1.131.2026082318\"",
+        )
+        buildConfigField(
+            "String",
+            "VSCODE_JA_LANGUAGE_PACK_SHA256",
+            "\"baa2f930fef889cc4331bf0cefa6c3622ad98f72a9975b10e1a14e6ab8afc28f\"",
+        )
+        buildConfigField(
+            "String",
+            "VSCODE_JA_LANGUAGE_PACK_URL",
+            "\"https://MS-CEINTL.gallerycdn.vsassets.io/extensions/ms-ceintl/vscode-language-pack-ja/1.131.2026082318/1787509274754/Microsoft.VisualStudio.Services.VSIXPackage\"",
         )
     }
 
