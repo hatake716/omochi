@@ -193,7 +193,10 @@ object WorkspaceTransfer {
             candidate.path.startsWith(root.path + File.separator)
     }
 
-    internal fun isExcludedExportEntry(source: File): Boolean = source.name == ".git"
+    internal fun isExcludedExportEntry(source: File): Boolean =
+        source.name == ".git" ||
+            source.name == "Omochi-Recovery" ||
+            source.name.startsWith(".omochi-sync-tmp-")
 
     private fun displayName(context: Context, uri: Uri): String? {
         context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)

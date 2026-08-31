@@ -21,8 +21,13 @@ The unit suite currently checks:
 - completion-marker parsing, including comments, malformed rows, and values containing `=`;
 - exact active-loopback URL acceptance and rejection of lookalike host, port, scheme, and user-info URLs;
 - explicit external-browser scheme allowlist;
+- popup classification for initial blank, active-loopback reuse, external-app handoff, and blocked schemes;
+- exact, active-origin-gated native menu routes for folder, linked-device folder, close, and exit actions;
+- `/workspace` folder normalization, traversal rejection, encoded Japanese paths, and loopback URL generation;
 - SAF destination-name sanitization and component length;
 - SAF export containment, including direct and nested symlink rejection.
+- bidirectional sync planning for initial import, one-sided edits, deletion/edit races, independent subtree
+  changes, concurrent conflict preservation, and file/directory type conflicts.
 
 Inspect the APK:
 
@@ -102,6 +107,21 @@ Use the 48dp top actions to show/hide the touch panel, enter/leave fullscreen, a
 touch panel between **キー** and **編集**. Confirm Enter, Backspace, Find/Replace, Quick Open, editor split,
 and new-terminal actions in addition to Esc/Tab/arrows.
 
+Open the three-line Code - OSS application menu and exercise every visible top-level group. In particular:
+
+1. Choose **ファイル → フォルダーを開く**, select a disposable `/workspace` subfolder, and confirm the visible
+   Explorer root changes in the current workbench rather than opening an invisible or blank window.
+2. Use the native top folder action to move to the parent, create a Japanese-named folder, enter it, and start
+   the workbench there. Confirm all rows and buttons are comfortably tappable.
+3. Choose **ローカル フォルダーを開く**, grant a disposable SAF tree, and confirm Omochi completes its first
+   mirror sync before switching the Explorer root to `/workspace/phone/<folder>`.
+4. Stop and reopen the IDE session, then cold-launch Omochi and confirm the same folder remains selected.
+5. Exercise **最近使用した項目** and any visible **新しいウィンドウ／ワークスペースを閉じる** actions;
+   confirm they reuse or leave the Android workbench intentionally and never destroy only the WebView renderer.
+6. Open a Help/documentation link and confirm Android handles it externally while the IDE session survives.
+7. Confirm invalid `file:`, `content:`, cross-port loopback, and non-loopback popup targets do not load inside
+   the privileged workbench.
+
 Latch Ctrl/Alt/Shift in the bottom bar and verify it resets after the next ordinary key.
 
 ### 5. Terminal and Git
@@ -147,6 +167,18 @@ Pixel 10a / Android 17 regression evidence from 2026-08-31:
 - Android Back returned to the same `WorkbenchActivity`, which displayed the session-continuity notice.
   No Anthropic credentials were entered, so the real account-login result and five-minute soak remain manual
   acceptance steps.
+- The three-line **File > Open Folder** route displayed only Omochi's native picker: no upstream quick-input
+  or hidden menu remained. The parent-menu scrollbar had `pointer-events: none`, so it no longer covered the
+  submenu's touch targets. **New Window** left one visible workbench page, and **Close Folder** reset `/workspace`.
+- With **Confirm Before Close** enabled, the former custom-URL route produced WebView's navigation confirmation
+  before Android could act. The final exact-origin prompt bridge opened the native picker without navigation or
+  a before-unload prompt, while spoofed actions and untrusted page origins remained rejected by URL policy.
+- With Explorer and an integrated terminal visible together, Code - OSS attempted to scroll its 518 CSS-pixel
+  desktop grid by 107 pixels. Omochi reset and pinned the mobile split view at zero, leaving the three-line menu
+  and Activity Bar at the visible left edge while both views remained open.
+- The native picker created and selected disposable `/workspace/Omochi-Menu-Test`. The resulting code-server
+  title and encoded URL used that path, `/healthz` returned `alive`, and a cold launcher restart restored the
+  same folder. The test then reset `/workspace` and removed the verified-empty disposable directory.
 
 ### 6. Japanese UI
 
@@ -168,6 +200,23 @@ visible Japanese Settings/workbench check.
 3. Export twice and confirm two timestamped directories exist.
 4. Hash selected binary files before import and after export.
 5. Add a symlink inside `/workspace` and confirm export stops with a clear rejection instead of following it.
+6. Tap **端末フォルダをリアルタイム連携**, select a disposable read/write folder, and confirm Android lists
+   Omochi under that tree's persisted URI permissions after leaving and reopening the app.
+7. Confirm the initial files appear under `/workspace/phone/<folder>`, including Unicode names and binary hashes.
+8. Edit and save a nested text file in Omochi. Within a few seconds, reopen it through Android's Files app and
+   compare the exact content. Then edit it externally and confirm the open/reopened workbench file reflects it.
+9. Create, rename, and delete disposable nested files from each side. Confirm the opposite side converges and any
+   delete/type replacement reports a recovery path under `/workspace/Omochi-Recovery`.
+10. Change the same file differently on both sides before either sync completes. Confirm the Omochi version remains
+    at the original path and a `.device-conflict-<timestamp>` file containing the device version exists on both sides.
+11. Add a working-tree symlink and confirm sync stops with a clear error without uploading the link target. Confirm
+    `.git` and `Omochi-Recovery` are not written into the selected SAF tree.
+12. Stop/restart the IDE session, rotate, background, and reboot the device. Confirm the same grant and mirror resume.
+13. Tap **連携解除** and confirm the SAF grant is released while `/workspace/phone/<folder>` remains intact.
+
+Run these steps with the Android External Storage provider and at least one cloud/document-provider implementation.
+Build success or a persisted URI entry alone is not real-time-editing acceptance; compare actual file bytes in both
+directions and exercise conflict/deletion recovery.
 
 ### 8. Lifecycle
 

@@ -60,7 +60,11 @@ object OmochiServerManager {
                 return
             }
             if (currentState is State.Running) {
-                publish(State.Running(OmochiRuntime.serverUrl(port)))
+                publish(
+                    State.Running(
+                        OmochiRuntime.serverUrl(port, WorkspaceSession.selectedGuestFolder(context))
+                    )
+                )
             } else {
                 pollUntilReady(context.applicationContext, generation.get(), port)
             }
@@ -273,7 +277,14 @@ object OmochiServerManager {
                 if (running == null || !running.isAlive) return@Thread
 
                 if (isResponding(port)) {
-                    publish(State.Running(OmochiRuntime.serverUrl(port)))
+                    publish(
+                        State.Running(
+                            OmochiRuntime.serverUrl(
+                                port,
+                                WorkspaceSession.selectedGuestFolder(context),
+                            )
+                        )
+                    )
                     return@Thread
                 }
 

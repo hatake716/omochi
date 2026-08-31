@@ -18,6 +18,7 @@ import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
+import android.webkit.JsPromptResult
 import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.ValueCallback
@@ -44,6 +45,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
@@ -53,12 +55,16 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.AccountTree
+import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Fullscreen
 import androidx.compose.material.icons.outlined.FullscreenExit
@@ -68,17 +74,22 @@ import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -91,6 +102,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.net.toUri
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
@@ -101,6 +114,7 @@ import org.json.JSONObject
 class WorkbenchActivity : ComponentActivity() {
     companion object {
         const val EXTRA_OPEN_TERMINAL = "io.github.hatake716.omochi.extra.OPEN_TERMINAL"
+        private const val NATIVE_MENU_PROMPT = "omochi-native-menu-v1"
     }
 
     private var webView: WebView? = null
@@ -116,16 +130,32 @@ class WorkbenchActivity : ComponentActivity() {
     private var touchPanelPage by mutableStateOf(TouchPanelPage.Keys)
     private var fullscreenEnabled by mutableStateOf(false)
     private var browserNotice by mutableStateOf<String?>(null)
+    private var syncState by mutableStateOf<WorkspaceSyncManager.State>(
+        WorkspaceSyncManager.State.Disconnected
+    )
+    private var workspaceFolder by mutableStateOf(WorkspaceSession.GUEST_ROOT)
+    private var workspacePicker by mutableStateOf<WorkspacePickerState?>(null)
+    private var openLinkedFolderAfterConnect = false
     private var externalBrowserPending = false
     private var initialTerminalPending = false
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
-    private val popupWebViews = mutableSetOf<WebView>()
+    private val popupWebViews = mutableMapOf<WebView, Boolean>()
 
     private val chooseWebFiles = registerForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
         fileChooserCallback?.onReceiveValue(uris.toTypedArray())
         fileChooserCallback = null
+    }
+
+    private val linkTree = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri == null) {
+            openLinkedFolderAfterConnect = false
+        } else {
+            WorkspaceSyncManager.connect(this, uri)
+        }
     }
 
     private val requestNotificationPermission = registerForActivityResult(
@@ -140,6 +170,28 @@ class WorkbenchActivity : ComponentActivity() {
         }
     }
 
+    private val syncListener: (WorkspaceSyncManager.State) -> Unit = { state ->
+        syncState = state
+        when (state) {
+            is WorkspaceSyncManager.State.Failed -> {
+                openLinkedFolderAfterConnect = false
+                browserNotice = "端末フォルダ同期: ${state.message}"
+            }
+            is WorkspaceSyncManager.State.Ready -> {
+                if (openLinkedFolderAfterConnect) {
+                    openLinkedFolderAfterConnect = false
+                    selectWorkspaceFolder(state.link.workspacePath)
+                }
+                val summary = state.summary
+                if (summary != null && summary.conflicts > 0) {
+                    browserNotice =
+                        "同時編集を検出しました。端末側の版を日時付き競合ファイルとして保存しました。"
+                }
+            }
+            else -> Unit
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (!OmochiRuntime.isInstalled(this)) {
@@ -148,11 +200,14 @@ class WorkbenchActivity : ComponentActivity() {
         }
 
         enableEdgeToEdge()
+        syncState = WorkspaceSyncManager.state(this)
+        workspaceFolder = WorkspaceSession.selectedGuestFolder(this)
         initialTerminalPending = intent.getBooleanExtra(EXTRA_OPEN_TERMINAL, false)
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         installBackHandler()
 
         OmochiServerManager.addListener(serverListener)
+        WorkspaceSyncManager.addListener(syncListener)
         OmochiServerService.start(this).onFailure {
             webError = "IDEセッションを開始できません: ${it.message ?: it.javaClass.simpleName}"
         }
@@ -168,10 +223,19 @@ class WorkbenchActivity : ComponentActivity() {
                     shiftLatched = shiftLatched,
                     touchPanelPage = touchPanelPage,
                     fullscreenEnabled = fullscreenEnabled,
+                    syncState = syncState,
+                    workspaceFolder = workspaceFolder,
+                    workspacePicker = workspacePicker,
                     createWebView = ::createWebView,
                     onClose = ::openHome,
                     onToggleTouchBar = { showTouchBar = !showTouchBar },
                     onToggleFullscreen = ::toggleFullscreen,
+                    onOpenWorkspacePicker = ::openWorkspacePicker,
+                    onBrowseWorkspaceFolder = ::browseWorkspaceFolder,
+                    onCreateWorkspaceFolder = ::createWorkspaceFolder,
+                    onSelectWorkspaceFolder = ::selectWorkspaceFolder,
+                    onDismissWorkspacePicker = { workspacePicker = null },
+                    onSyncFolder = ::handleSyncFolder,
                     onExplorer = { activateWorkbenchView("codicon-explorer-view-icon") },
                     onSearch = { activateWorkbenchView("codicon-search-view-icon") },
                     onSourceControl = { activateWorkbenchView("codicon-source-control-view-icon") },
@@ -206,6 +270,7 @@ class WorkbenchActivity : ComponentActivity() {
                 webError = "IDEセッションを再起動できません: ${it.message ?: it.javaClass.simpleName}"
             }
         }
+        WorkspaceSyncManager.requestSync(this, verifyBothSides = false)
     }
 
     override fun onPause() {
@@ -217,6 +282,7 @@ class WorkbenchActivity : ComponentActivity() {
 
     override fun onDestroy() {
         OmochiServerManager.removeListener(serverListener)
+        WorkspaceSyncManager.removeListener(syncListener)
         fileChooserCallback?.onReceiveValue(null)
         fileChooserCallback = null
         webView?.let { view ->
@@ -227,8 +293,94 @@ class WorkbenchActivity : ComponentActivity() {
             view.destroy()
         }
         webView = null
-        popupWebViews.toList().forEach(::destroyPopup)
+        popupWebViews.keys.toList().forEach(::destroyPopup)
         super.onDestroy()
+    }
+
+    private fun openWorkspacePicker() {
+        browseWorkspaceFolder(workspaceFolder)
+    }
+
+    private fun browseWorkspaceFolder(guestPath: String) {
+        val current = WorkspaceSession.resolveFolder(this, guestPath).getOrElse {
+            workspacePicker = WorkspacePickerState(
+                currentGuestPath = WorkspaceSession.GUEST_ROOT,
+                folders = emptyList(),
+                error = it.message ?: "作業フォルダーを読み込めませんでした。",
+            )
+            return
+        }
+        val folders = WorkspaceSession.listFolders(this, current.guestPath).getOrElse {
+            workspacePicker = WorkspacePickerState(
+                currentGuestPath = current.guestPath,
+                folders = emptyList(),
+                error = it.message ?: "フォルダー一覧を読み込めませんでした。",
+            )
+            return
+        }
+        workspacePicker = WorkspacePickerState(
+            currentGuestPath = current.guestPath,
+            folders = folders,
+            error = null,
+        )
+    }
+
+    private fun createWorkspaceFolder(name: String) {
+        val current = workspacePicker ?: return
+        WorkspaceSession.createFolder(this, current.currentGuestPath, name)
+            .onSuccess { created -> browseWorkspaceFolder(created.guestPath) }
+            .onFailure { error ->
+                workspacePicker = current.copy(
+                    error = error.message ?: "フォルダーを作成できませんでした。",
+                )
+            }
+    }
+
+    private fun selectWorkspaceFolder(guestPath: String) {
+        WorkspaceSession.selectFolder(this, guestPath)
+            .onSuccess { selected ->
+                workspaceFolder = selected.guestPath
+                workspacePicker = null
+                loadedUrl = null
+                browserNotice = "作業フォルダーを ${selected.guestPath} に変更しています…"
+                OmochiServerService.restart(this).onFailure {
+                    browserNotice = "作業フォルダーは保存しましたが、IDEを再起動できませんでした。"
+                }
+            }
+            .onFailure { error ->
+                val current = workspacePicker
+                if (current != null) {
+                    workspacePicker = current.copy(
+                        error = error.message ?: "作業フォルダーを変更できませんでした。",
+                    )
+                } else {
+                    browserNotice = error.message ?: "作業フォルダーを変更できませんでした。"
+                }
+            }
+    }
+
+    private fun captureWorkspaceFolder(uri: Uri) {
+        if (!isTrustedWorkbenchUri(uri)) return
+        WorkspaceSession.captureFolderFromUrl(this, uri.toString())?.let { selected ->
+            workspaceFolder = selected.guestPath
+        }
+    }
+
+    private fun handleSyncFolder() {
+        when (val state = syncState) {
+            WorkspaceSyncManager.State.Disconnected -> {
+                openLinkedFolderAfterConnect = false
+                linkTree.launch(null)
+            }
+            is WorkspaceSyncManager.State.Syncing -> {
+                if (state.link == null) {
+                    openLinkedFolderAfterConnect = false
+                    linkTree.launch(null)
+                }
+            }
+            is WorkspaceSyncManager.State.Ready,
+            is WorkspaceSyncManager.State.Failed -> WorkspaceSyncManager.requestSync(this)
+        }
     }
 
     private fun installBackHandler() {
@@ -332,7 +484,9 @@ class WorkbenchActivity : ComponentActivity() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 webError = null
-                if (!submitLocalLogin(view, url.toUri())) {
+                val uri = url.toUri()
+                captureWorkspaceFolder(uri)
+                if (!submitLocalLogin(view, uri)) {
                     injectTouchWorkbench(view)
                     if (initialTerminalPending) {
                         initialTerminalPending = false
@@ -395,15 +549,45 @@ class WorkbenchActivity : ComponentActivity() {
                 return true
             }
 
+            override fun onJsPrompt(
+                view: WebView,
+                url: String,
+                message: String,
+                defaultValue: String?,
+                result: JsPromptResult,
+            ): Boolean {
+                if (message != NATIVE_MENU_PROMPT) {
+                    return super.onJsPrompt(view, url, message, defaultValue, result)
+                }
+                val runningUrl = (serverState as? OmochiServerManager.State.Running)?.url
+                val action = WorkbenchUrlPolicy.nativeMenuAction(
+                    runningUrl = runningUrl,
+                    currentPageUrl = url,
+                    candidateUrl = "omochi://menu/${defaultValue.orEmpty()}",
+                )
+                if (action == null) {
+                    result.cancel()
+                    return true
+                }
+                result.confirm("handled")
+                view.post {
+                    // Code - OSS ignores synthetic JavaScript Escape events for some
+                    // menu states. Send a trusted Android key before the Compose dialog
+                    // appears, then allow one frame for the upstream menu to close.
+                    dispatchKey(KeyEvent.KEYCODE_ESCAPE, 0)
+                    view.postDelayed({ handleNativeMenuAction(action) }, 50L)
+                }
+                return true
+            }
+
             override fun onCreateWindow(
                 view: WebView,
                 isDialog: Boolean,
                 isUserGesture: Boolean,
                 resultMsg: Message,
             ): Boolean {
-                if (!isUserGesture) return false
                 val popup = createRoutedPopupWebView()
-                popupWebViews += popup
+                popupWebViews[popup] = isUserGesture
                 val transport = resultMsg.obj as? WebView.WebViewTransport ?: run {
                     destroyPopup(popup)
                     return false
@@ -414,7 +598,11 @@ class WorkbenchActivity : ComponentActivity() {
             }
 
             override fun onCloseWindow(window: WebView) {
-                destroyPopup(window)
+                if (window === webView) {
+                    openHome()
+                } else {
+                    destroyPopup(window)
+                }
             }
         }
 
@@ -432,13 +620,46 @@ class WorkbenchActivity : ComponentActivity() {
     }
 
     private fun routeUrl(uri: Uri): Boolean {
+        val runningUrl = (serverState as? OmochiServerManager.State.Running)?.url
+        val nativeAction = WorkbenchUrlPolicy.nativeMenuAction(
+            runningUrl = runningUrl,
+            currentPageUrl = webView?.url,
+            candidateUrl = uri.toString(),
+        )
+        if (nativeAction != null) return handleNativeMenuAction(nativeAction)
         if (uri.scheme == "about" || uri.scheme == "blob" || uri.scheme == "data") return false
-        if (isTrustedWorkbenchUri(uri)) return false
+        if (isTrustedWorkbenchUri(uri)) {
+            captureWorkspaceFolder(uri)
+            return false
+        }
 
         if (WorkbenchUrlPolicy.shouldOpenExternally(uri.scheme)) {
             openExternalUri(uri)
         }
         return true
+    }
+
+    private fun handleNativeMenuAction(action: WorkbenchUrlPolicy.NativeMenuAction): Boolean {
+        when (action) {
+            WorkbenchUrlPolicy.NativeMenuAction.OPEN_FOLDER -> {
+                openWorkspacePicker()
+                return true
+            }
+            WorkbenchUrlPolicy.NativeMenuAction.LINK_DEVICE_FOLDER -> {
+                openLinkedFolderAfterConnect = true
+                linkTree.launch(null)
+                return true
+            }
+            WorkbenchUrlPolicy.NativeMenuAction.CLOSE_FOLDER -> {
+                selectWorkspaceFolder(WorkspaceSession.GUEST_ROOT)
+                return true
+            }
+            WorkbenchUrlPolicy.NativeMenuAction.EXIT_WORKBENCH -> {
+                OmochiServerService.stop(this)
+                finishAndRemoveTask()
+                return true
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -449,25 +670,53 @@ class WorkbenchActivity : ComponentActivity() {
         settings.allowContentAccess = false
         webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                val handled = routeUrl(request.url)
-                if (handled) destroyPopup(view)
-                return handled
+                return routePopupUrl(view, request.url)
             }
 
             override fun onPageFinished(view: WebView, url: String) {
                 val uri = runCatching { url.toUri() }.getOrNull() ?: return
-                if (!isTrustedWorkbenchUri(uri) &&
-                    (uri.scheme == "http" || uri.scheme == "https" || uri.scheme == "mailto")
-                ) {
+                if (uri.scheme != "about") routePopupUrl(view, uri)
+            }
+        }
+    }
+
+    /**
+     * Code - OSS models desktop window operations with window.open(). Android has one
+     * workbench surface, so trusted popups are deliberately adopted by the main WebView.
+     * This keeps Open Folder, Open Recent, workspace switching and new-window commands
+     * visible instead of stranding them in an unattached WebView.
+     */
+    private fun routePopupUrl(popup: WebView, uri: Uri): Boolean {
+        val runningUrl = (serverState as? OmochiServerManager.State.Running)?.url
+        return when (WorkbenchUrlPolicy.classifyPopup(runningUrl, uri.toString())) {
+            WorkbenchUrlPolicy.PopupTarget.INITIAL_BLANK -> false
+            WorkbenchUrlPolicy.PopupTarget.REUSE_WORKBENCH -> {
+                captureWorkspaceFolder(uri)
+                val target = uri.toString()
+                loadedUrl = target
+                webView?.takeIf { it !== popup }?.loadUrl(target)
+                destroyPopup(popup)
+                true
+            }
+            WorkbenchUrlPolicy.PopupTarget.EXTERNAL_APP -> {
+                if (popupWebViews[popup] == true) {
                     openExternalUri(uri)
-                    destroyPopup(view)
+                } else {
+                    browserNotice = "自動的に開こうとした外部ページをブロックしました。"
                 }
+                destroyPopup(popup)
+                true
+            }
+            WorkbenchUrlPolicy.PopupTarget.BLOCKED -> {
+                browserNotice = "このメニュー操作は安全なAndroid画面へ変換できませんでした。"
+                destroyPopup(popup)
+                true
             }
         }
     }
 
     private fun destroyPopup(view: WebView) {
-        popupWebViews -= view
+        popupWebViews.remove(view)
         runCatching {
             view.stopLoading()
             view.webChromeClient = null
@@ -544,6 +793,12 @@ class WorkbenchActivity : ComponentActivity() {
                 .monaco-workbench { font-family: -apple-system, BlinkMacSystemFont, Roboto, sans-serif !important; }
                 .monaco-workbench .part.activitybar .action-item,
                 .monaco-workbench .part.activitybar .action-label { min-height: 48px !important; min-width: 48px !important; }
+                .monaco-workbench .menubar-menu-button,
+                .monaco-workbench .menubar-menu-button .menubar-menu-title {
+                  min-width: 48px !important;
+                  min-height: 48px !important;
+                  line-height: 48px !important;
+                }
                 .monaco-workbench .part.sidebar .monaco-list-row,
                 .monaco-workbench .part.auxiliarybar .monaco-list-row,
                 .monaco-workbench .quick-input-list .monaco-list-row { min-height: 40px !important; }
@@ -557,7 +812,16 @@ class WorkbenchActivity : ComponentActivity() {
                 .monaco-workbench .monaco-scrollable-element > .scrollbar.horizontal { height: 16px !important; }
                 .quick-input-widget { top: 6% !important; width: min(92vw, 720px) !important; margin-left: auto !important; margin-right: auto !important; border-radius: 14px !important; overflow: hidden; }
                 .context-view, .monaco-menu-container { max-width: calc(100vw - 12px) !important; }
-                .monaco-menu .monaco-action-bar.vertical .action-item { min-height: 44px !important; }
+                .monaco-menu .monaco-action-bar.vertical .action-item,
+                .monaco-menu .monaco-action-bar.vertical .action-menu-item {
+                  min-height: 48px !important;
+                  line-height: 48px !important;
+                }
+                .monaco-menu .action-label { padding-top: 4px !important; padding-bottom: 4px !important; }
+                .menubar-menu-button.open .menubar-menu-items-holder > .monaco-scrollable-element > .scrollbar.vertical {
+                  opacity: 0 !important;
+                  pointer-events: none !important;
+                }
                 .monaco-workbench .part.statusbar { min-height: 32px !important; }
                 .monaco-workbench .breadcrumbs-below-tabs { min-height: 38px !important; }
                 .monaco-workbench .notifications-toasts .notification-toast { border-radius: 12px !important; }
@@ -627,7 +891,197 @@ class WorkbenchActivity : ComponentActivity() {
               `;
               document.head.appendChild(style);
 
-              const hideExtensions = () => {
+              const nativeMenuRoutes = new Map([
+                ['workbench.action.files.openFolder', 'omochi://menu/open-folder'],
+                ['workbench.action.files.openFolderInNewWindow', 'omochi://menu/open-folder'],
+                ['workbench.action.files.openFolderViaWorkspace', 'omochi://menu/open-folder'],
+                ['workbench.action.files.openLocalFolder', 'omochi://menu/link-device-folder'],
+                ['workbench.action.closeFolder', 'omochi://menu/close-folder'],
+                ['workbench.action.quit', 'omochi://menu/exit-workbench'],
+                ['workbench.action.exit', 'omochi://menu/exit-workbench'],
+              ]);
+              const nativeMenuLabelRoutes = new Map([
+                ['フォルダーを開く', 'omochi://menu/open-folder'],
+                ['open folder', 'omochi://menu/open-folder'],
+                ['新しいウィンドウでフォルダーを開く', 'omochi://menu/open-folder'],
+                ['open folder in new window', 'omochi://menu/open-folder'],
+                ['ローカル フォルダーを開く', 'omochi://menu/link-device-folder'],
+                ['open local folder', 'omochi://menu/link-device-folder'],
+                ['フォルダーを閉じる', 'omochi://menu/close-folder'],
+                ['ワークスペースを閉じる', 'omochi://menu/close-folder'],
+                ['close folder', 'omochi://menu/close-folder'],
+                ['close workspace', 'omochi://menu/close-folder'],
+                ['終了', 'omochi://menu/exit-workbench'],
+                ['quit', 'omochi://menu/exit-workbench'],
+                ['exit', 'omochi://menu/exit-workbench'],
+                ['ウィンドウを閉じる', 'omochi://menu/exit-workbench'],
+                ['close window', 'omochi://menu/exit-workbench'],
+              ]);
+              const normalizedMenuLabel = (value) => (value || '')
+                .split('\n', 1)[0]
+                .trim()
+                .replace(/[.\u2026]+$/u, '')
+                .trim()
+                .toLocaleLowerCase();
+              const unsupportedMenuLabels = new Set([
+                '拡張機能',
+                'extensions',
+                'その他のデバッガーをインストールします',
+                'install additional debuggers',
+                'sign out of code-server',
+              ]);
+              const dismissWorkbenchOverlay = () => {
+                const target = document.activeElement || document.body;
+                const options = {
+                  key: 'Escape',
+                  code: 'Escape',
+                  keyCode: 27,
+                  which: 27,
+                  bubbles: true,
+                  cancelable: true,
+                  composed: true,
+                };
+                target.dispatchEvent(new KeyboardEvent('keydown', options));
+                target.dispatchEvent(new KeyboardEvent('keyup', options));
+                document.querySelector('.menubar-menu-button.open')?.click();
+              };
+              const menuActionForEvent = (event) => {
+                const action = event.target instanceof Element
+                  ? event.target.closest('.action-menu-item')
+                  : null;
+                return !action || action.classList.contains('disabled') ? null : action;
+              };
+              const nativeMenuRouteForAction = (action) => {
+                if (!action) return null;
+                const commandTarget = action.closest('[data-command-id]')
+                  || action.querySelector('[data-command-id]');
+                return nativeMenuRoutes.get(commandTarget?.getAttribute('data-command-id'))
+                  || nativeMenuLabelRoutes.get(normalizedMenuLabel(action.innerText));
+              };
+              let armedMenuAction = null;
+              let ignoreMenuClickUntil = 0;
+              let dispatchingMenuClick = false;
+              const dispatchNativeMenu = (route) => {
+                dismissWorkbenchOverlay();
+                window.prompt(
+                  'omochi-native-menu-v1',
+                  route.substring('omochi://menu/'.length),
+                );
+              };
+              const dispatchWorkbenchMenu = (action) => {
+                if (action.getAttribute('aria-haspopup') === 'true' ||
+                    action.querySelector('.submenu-indicator')) {
+                  const rect = action.getBoundingClientRect();
+                  ['mouseover', 'mousemove'].forEach((type) => {
+                    action.dispatchEvent(new MouseEvent(type, {
+                      bubbles: true,
+                      cancelable: true,
+                      composed: true,
+                      view: window,
+                      clientX: rect.left + rect.width / 2,
+                      clientY: rect.top + rect.height / 2,
+                      movementX: type === 'mousemove' ? 1 : 0,
+                    }));
+                  });
+                  return;
+                }
+                dispatchingMenuClick = true;
+                try {
+                  action.click();
+                } finally {
+                  dispatchingMenuClick = false;
+                }
+              };
+              const dispatchMenuAction = (selected) => {
+                if (selected.route) dispatchNativeMenu(selected.route);
+                else if (selected.action?.isConnected) dispatchWorkbenchMenu(selected.action);
+              };
+              const stopMenuEvent = (event) => {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+              };
+              const handleTouchMenuPointer = (event) => {
+                const liveAction = menuActionForEvent(event);
+                const selected = liveAction ? {
+                  action: liveAction,
+                  route: nativeMenuRouteForAction(liveAction),
+                } : armedMenuAction;
+                if (!selected) return;
+
+                if (event.type === 'click') {
+                  if (dispatchingMenuClick) return;
+                  if (performance.now() < ignoreMenuClickUntil) {
+                    stopMenuEvent(event);
+                    return;
+                  }
+                  if (!selected.route) return;
+                  stopMenuEvent(event);
+                  dispatchNativeMenu(selected.route);
+                  return;
+                }
+
+                if (event.type === 'pointerdown') {
+                  armedMenuAction = {
+                    action: selected.action,
+                    route: selected.route,
+                    pointerId: event.pointerId,
+                    x: event.clientX,
+                    y: event.clientY,
+                    moved: false,
+                  };
+                  // Native replacements must never reach Code - OSS. Regular menu
+                  // rows keep their down/move stream so long menus remain scrollable.
+                  if (selected.route) stopMenuEvent(event);
+                  return;
+                }
+                if (event.type === 'pointermove' && armedMenuAction) {
+                  if (Math.abs(event.clientX - armedMenuAction.x) > 12 ||
+                      Math.abs(event.clientY - armedMenuAction.y) > 12) {
+                    armedMenuAction.moved = true;
+                  }
+                  if (armedMenuAction.route) stopMenuEvent(event);
+                  return;
+                }
+                if (event.type === 'pointercancel') {
+                  armedMenuAction = null;
+                  return;
+                }
+                if (event.type === 'pointerup') {
+                  const armed = armedMenuAction;
+                  armedMenuAction = null;
+                  if (!armed) return;
+                  ignoreMenuClickUntil = performance.now() + 600;
+                  if (armed.route || !armed.moved) stopMenuEvent(event);
+                  if (!armed.moved) {
+                    dispatchMenuAction(armed);
+                  }
+                  return;
+                }
+                if (event.type === 'mousedown' || event.type === 'mouseup' ||
+                    event.type === 'touchstart' || event.type === 'touchend') {
+                  if (selected.route || performance.now() < ignoreMenuClickUntil) {
+                    stopMenuEvent(event);
+                  }
+                  return;
+                }
+              };
+              [
+                'pointerdown',
+                'pointermove',
+                'pointerup',
+                'pointercancel',
+                'mousedown',
+                'mouseup',
+                'touchstart',
+                'touchend',
+                'click',
+              ].forEach((type) => window.addEventListener(
+                type,
+                handleTouchMenuPointer,
+                { capture: true, passive: false },
+              ));
+
+              const hideUnsupportedActions = () => {
                 let hidden = false;
                 document.querySelectorAll('[aria-label], [data-id], [data-command-id]').forEach((element) => {
                   const label = (element.getAttribute('aria-label') || '').toLowerCase();
@@ -638,8 +1092,34 @@ class WorkbenchActivity : ComponentActivity() {
                     hidden = true;
                   }
                 });
+                document.querySelectorAll('.monaco-menu .action-menu-item').forEach((element) => {
+                  if (!unsupportedMenuLabels.has(normalizedMenuLabel(element.innerText))) return;
+                  const target = element.closest('.action-item') || element;
+                  target.style.setProperty('display', 'none', 'important');
+                  target.setAttribute('aria-hidden', 'true');
+                  hidden = true;
+                });
                 return hidden;
               };
+
+              let unsupportedActionsFrame = 0;
+              const scheduleUnsupportedActionsPass = () => {
+                if (unsupportedActionsFrame) return;
+                unsupportedActionsFrame = window.requestAnimationFrame(() => {
+                  unsupportedActionsFrame = 0;
+                  hideUnsupportedActions();
+                });
+              };
+              const unsupportedActionsObserver = new MutationObserver((mutations) => {
+                if (mutations.some((mutation) => [...mutation.addedNodes].some((node) =>
+                  node instanceof Element && (
+                    node.matches('.action-item, .action-menu-item, .monaco-menu, .monaco-menu-container') ||
+                    node.querySelector('.action-item, .action-menu-item, .monaco-menu, .monaco-menu-container')
+                  )
+                ))) scheduleUnsupportedActionsPass();
+              });
+              unsupportedActionsObserver.observe(document.body, { childList: true, subtree: true });
+              window.__omochiUnsupportedActionsObserver = unsupportedActionsObserver;
 
               const prepareCompactLayout = () => {
                 if (window.innerWidth > 600 || window.__omochiCompactLayoutPrepared) return true;
@@ -658,14 +1138,34 @@ class WorkbenchActivity : ComponentActivity() {
                 return true;
               };
 
-              hideExtensions();
+              const pinMobileWorkbenchOrigin = () => {
+                if (window.innerWidth > 600) return true;
+                const activityBar = document.querySelector('.part.activitybar.left');
+                const splitView = activityBar?.parentElement?.parentElement;
+                if (!splitView?.classList.contains('split-view-container')) return false;
+                if (!splitView.__omochiOriginPinned) {
+                  splitView.__omochiOriginPinned = true;
+                  splitView.addEventListener('scroll', () => {
+                    if (window.innerWidth <= 600 && splitView.scrollLeft !== 0) {
+                      splitView.scrollLeft = 0;
+                    }
+                  }, { passive: true });
+                }
+                if (splitView.scrollLeft !== 0) splitView.scrollLeft = 0;
+                return true;
+              };
+              window.addEventListener('resize', pinMobileWorkbenchOrigin);
+
+              hideUnsupportedActions();
+              pinMobileWorkbenchOrigin();
               prepareCompactLayout();
               let passes = 0;
               const extensionTimer = window.setInterval(() => {
-                const hidden = hideExtensions();
+                const hidden = hideUnsupportedActions();
                 const compact = prepareCompactLayout();
+                const pinned = pinMobileWorkbenchOrigin();
                 passes += 1;
-                if ((hidden && compact) || passes >= 20) window.clearInterval(extensionTimer);
+                if ((hidden && compact && pinned) || passes >= 20) window.clearInterval(extensionTimer);
               }, 250);
             })();
         """.trimIndent()
@@ -811,6 +1311,12 @@ class WorkbenchActivity : ComponentActivity() {
 
 private enum class TouchPanelPage { Keys, Edit }
 
+private data class WorkspacePickerState(
+    val currentGuestPath: String,
+    val folders: List<WorkspaceSession.Folder>,
+    val error: String?,
+)
+
 @Composable
 private fun WorkbenchScreen(
     serverState: OmochiServerManager.State,
@@ -821,10 +1327,19 @@ private fun WorkbenchScreen(
     shiftLatched: Boolean,
     touchPanelPage: TouchPanelPage,
     fullscreenEnabled: Boolean,
+    syncState: WorkspaceSyncManager.State,
+    workspaceFolder: String,
+    workspacePicker: WorkspacePickerState?,
     createWebView: () -> WebView,
     onClose: () -> Unit,
     onToggleTouchBar: () -> Unit,
     onToggleFullscreen: () -> Unit,
+    onOpenWorkspacePicker: () -> Unit,
+    onBrowseWorkspaceFolder: (String) -> Unit,
+    onCreateWorkspaceFolder: (String) -> Unit,
+    onSelectWorkspaceFolder: (String) -> Unit,
+    onDismissWorkspacePicker: () -> Unit,
+    onSyncFolder: () -> Unit,
     onExplorer: () -> Unit,
     onSearch: () -> Unit,
     onSourceControl: () -> Unit,
@@ -854,11 +1369,15 @@ private fun WorkbenchScreen(
     ) {
         StudioTopBar(
             state = serverState,
+            syncState = syncState,
+            workspaceFolder = workspaceFolder,
             touchPanelVisible = showTouchBar,
             fullscreenEnabled = fullscreenEnabled,
             onClose = onClose,
             onToggleTouchPanel = onToggleTouchBar,
             onToggleFullscreen = onToggleFullscreen,
+            onOpenWorkspacePicker = onOpenWorkspacePicker,
+            onSyncFolder = onSyncFolder,
         )
 
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -913,16 +1432,209 @@ private fun WorkbenchScreen(
             )
         }
     }
+
+    workspacePicker?.let { picker ->
+        WorkspacePickerDialog(
+            state = picker,
+            selectedGuestPath = workspaceFolder,
+            onBrowse = onBrowseWorkspaceFolder,
+            onCreateFolder = onCreateWorkspaceFolder,
+            onSelect = onSelectWorkspaceFolder,
+            onDismiss = onDismissWorkspacePicker,
+        )
+    }
+}
+
+@Composable
+private fun WorkspacePickerDialog(
+    state: WorkspacePickerState,
+    selectedGuestPath: String,
+    onBrowse: (String) -> Unit,
+    onCreateFolder: (String) -> Unit,
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var newFolderName by remember(state.currentGuestPath) { mutableStateOf("") }
+    val parent = WorkspaceSession.parentGuestFolder(state.currentGuestPath)
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            color = OmochiColors.Raised,
+            shape = RoundedCornerShape(24.dp),
+            shadowElevation = 14.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp)
+                .widthIn(max = 680.dp)
+                .heightIn(max = 660.dp),
+        ) {
+            Column(modifier = Modifier.padding(18.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Outlined.FolderOpen,
+                        contentDescription = null,
+                        tint = OmochiColors.Accent,
+                        modifier = Modifier.size(28.dp),
+                    )
+                    Column(modifier = Modifier.weight(1f).padding(start = 11.dp)) {
+                        Text(
+                            "作業フォルダーを変更",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = OmochiColors.Ink,
+                        )
+                        Text(
+                            state.currentGuestPath,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OmochiColors.Muted,
+                        )
+                    }
+                    IconButton(onClick = onDismiss, modifier = Modifier.size(48.dp)) {
+                        Icon(Icons.Outlined.Close, contentDescription = "閉じる")
+                    }
+                }
+
+                Text(
+                    "Omochi内の /workspace と、連携した端末フォルダーのミラーから選択できます。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = OmochiColors.Muted,
+                    modifier = Modifier.padding(top = 10.dp, bottom = 12.dp),
+                )
+
+                HorizontalDivider(color = OmochiColors.Border)
+
+                if (parent != null) {
+                    WorkspaceFolderRow(
+                        title = "ひとつ上のフォルダー",
+                        detail = parent,
+                        selected = false,
+                        onClick = { onBrowse(parent) },
+                    )
+                }
+
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 270.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    items(state.folders, key = { it.guestPath }) { folder ->
+                        WorkspaceFolderRow(
+                            title = folder.displayName,
+                            detail = if (folder.guestPath == selectedGuestPath) {
+                                "現在開いています"
+                            } else if (folder.hasChildren) {
+                                "タップして中を見る"
+                            } else {
+                                folder.guestPath
+                            },
+                            selected = folder.guestPath == selectedGuestPath,
+                            onClick = { onBrowse(folder.guestPath) },
+                        )
+                    }
+                }
+
+                if (state.folders.isEmpty()) {
+                    Text(
+                        "このフォルダー内にサブフォルダーはありません。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = OmochiColors.Muted,
+                        modifier = Modifier.padding(vertical = 12.dp),
+                    )
+                }
+
+                state.error?.let { error ->
+                    Text(
+                        error,
+                        color = OmochiColors.Red,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(vertical = 8.dp),
+                    )
+                }
+
+                OutlinedTextField(
+                    value = newFolderName,
+                    onValueChange = { newFolderName = it },
+                    label = { Text("新しいフォルダー名") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(
+                        onClick = { onCreateFolder(newFolderName) },
+                        enabled = WorkspaceSession.isValidFolderName(newFolderName.trim()),
+                    ) {
+                        Icon(Icons.Outlined.CreateNewFolder, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("フォルダー作成")
+                    }
+                    Button(onClick = { onSelect(state.currentGuestPath) }) {
+                        Text("ここで開始")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WorkspaceFolderRow(
+    title: String,
+    detail: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        color = if (selected) OmochiColors.AccentSoft else Color.Transparent,
+        shape = RoundedCornerShape(13.dp),
+        modifier = Modifier.fillMaxWidth().heightIn(min = 58.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Outlined.FolderOpen,
+                contentDescription = null,
+                tint = if (selected) OmochiColors.Accent else OmochiColors.Ink,
+                modifier = Modifier.size(24.dp),
+            )
+            Column(modifier = Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge, color = OmochiColors.Ink)
+                Text(
+                    detail,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = OmochiColors.Muted,
+                    maxLines = 1,
+                )
+            }
+            Icon(
+                Icons.Outlined.ChevronRight,
+                contentDescription = "開く",
+                tint = OmochiColors.Muted,
+                modifier = Modifier.size(22.dp),
+            )
+        }
+    }
 }
 
 @Composable
 private fun StudioTopBar(
     state: OmochiServerManager.State,
+    syncState: WorkspaceSyncManager.State,
+    workspaceFolder: String,
     touchPanelVisible: Boolean,
     fullscreenEnabled: Boolean,
     onClose: () -> Unit,
     onToggleTouchPanel: () -> Unit,
     onToggleFullscreen: () -> Unit,
+    onOpenWorkspacePicker: () -> Unit,
+    onSyncFolder: () -> Unit,
 ) {
     val stateText = when (state) {
         OmochiServerManager.State.Stopped -> "待機中"
@@ -934,6 +1646,18 @@ private fun StudioTopBar(
         is OmochiServerManager.State.Running -> OmochiColors.Green
         is OmochiServerManager.State.Failed -> OmochiColors.Red
         else -> OmochiColors.Yellow
+    }
+    val syncText = when (syncState) {
+        WorkspaceSyncManager.State.Disconnected -> "端末未連携"
+        is WorkspaceSyncManager.State.Ready -> "端末同期"
+        is WorkspaceSyncManager.State.Syncing -> "同期中"
+        is WorkspaceSyncManager.State.Failed -> "同期要確認"
+    }
+    val syncLinked = when (syncState) {
+        WorkspaceSyncManager.State.Disconnected -> false
+        is WorkspaceSyncManager.State.Ready -> true
+        is WorkspaceSyncManager.State.Syncing -> syncState.link != null
+        is WorkspaceSyncManager.State.Failed -> syncState.link != null
     }
 
     Row(
@@ -958,13 +1682,25 @@ private fun StudioTopBar(
                 Box(Modifier.size(7.dp).clip(CircleShape).background(stateColor))
                 Spacer(Modifier.width(5.dp))
                 Text(
-                    stateText,
+                    "$stateText・$syncText",
                     style = MaterialTheme.typography.labelSmall,
                     color = OmochiColors.Muted,
                     maxLines = 1,
                 )
             }
         }
+        TopAction(
+            icon = Icons.Outlined.FolderOpen,
+            label = "作業フォルダーを変更: $workspaceFolder",
+            onClick = onOpenWorkspacePicker,
+            active = workspaceFolder != WorkspaceSession.GUEST_ROOT,
+        )
+        TopAction(
+            icon = Icons.Outlined.Sync,
+            label = if (syncLinked) "端末フォルダを今すぐ同期" else "端末フォルダを連携",
+            onClick = onSyncFolder,
+            active = syncLinked,
+        )
         TopAction(
             icon = if (touchPanelVisible) Icons.Outlined.KeyboardHide else Icons.Outlined.Keyboard,
             label = if (touchPanelVisible) "タッチキーを隠す" else "タッチキーを表示",

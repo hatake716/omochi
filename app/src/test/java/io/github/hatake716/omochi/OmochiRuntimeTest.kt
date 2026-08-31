@@ -56,7 +56,14 @@ class OmochiRuntimeTest {
     @Test
     fun serverAlwaysUsesLoopback() {
         assertEquals("http://127.0.0.1:54321/?folder=/workspace", OmochiRuntime.serverUrl(54321))
+        assertEquals(
+            "http://127.0.0.1:54321/?folder=/workspace/project%20one",
+            OmochiRuntime.serverUrl(54321, "/workspace/project one"),
+        )
         assertThrows(IllegalArgumentException::class.java) { OmochiRuntime.serverUrl(80) }
+        assertThrows(IllegalArgumentException::class.java) {
+            OmochiRuntime.serverUrl(54321, "/root")
+        }
     }
 
     @Test

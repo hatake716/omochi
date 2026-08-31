@@ -39,8 +39,10 @@ import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material.icons.outlined.FolderCopy
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Storage
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material3.Button
@@ -68,6 +70,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private var installed by mutableStateOf(false)
@@ -78,12 +83,19 @@ class MainActivity : ComponentActivity() {
     private var setupMessage by mutableStateOf("未セットアップ")
     private var transferRunning by mutableStateOf(false)
     private var transferMessage by mutableStateOf<String?>(null)
+    private var syncState by mutableStateOf<WorkspaceSyncManager.State>(
+        WorkspaceSyncManager.State.Disconnected
+    )
     private var serverState by mutableStateOf<OmochiServerManager.State>(
         OmochiServerManager.state()
     )
 
     private val serverListener: (OmochiServerManager.State) -> Unit = { state ->
         serverState = state
+    }
+
+    private val syncListener: (WorkspaceSyncManager.State) -> Unit = { state ->
+        syncState = state
     }
 
     private val openDocuments = registerForActivityResult(
@@ -110,9 +122,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val linkTree = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        uri?.let { WorkspaceSyncManager.connect(this, it) }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        syncState = WorkspaceSyncManager.state(this)
         refreshRuntimeState()
         setContent {
             OmochiTheme {
@@ -126,6 +145,7 @@ class MainActivity : ComponentActivity() {
                     setupMessage = setupMessage,
                     transferRunning = transferRunning,
                     transferMessage = transferMessage,
+                    syncState = syncState,
                     serverState = serverState,
                     onSetup = ::startSetup,
                     onOpenWorkbench = { openWorkbench(openTerminal = false) },
@@ -134,6 +154,9 @@ class MainActivity : ComponentActivity() {
                     onImportFiles = { openDocuments.launch(arrayOf("*/*")) },
                     onImportFolder = { importTree.launch(null) },
                     onExport = { exportTree.launch(null) },
+                    onLinkFolder = { linkTree.launch(null) },
+                    onSyncNow = { WorkspaceSyncManager.requestSync(this) },
+                    onDisconnectFolder = { WorkspaceSyncManager.disconnect(this) },
                     onLegal = { startActivity(Intent(this, LegalActivity::class.java)) },
                 )
             }
@@ -143,9 +166,11 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         OmochiServerManager.addListener(serverListener)
+        WorkspaceSyncManager.addListener(syncListener)
     }
 
     override fun onStop() {
+        WorkspaceSyncManager.removeListener(syncListener)
         OmochiServerManager.removeListener(serverListener)
         super.onStop()
     }
@@ -153,6 +178,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         if (!setupRunning) refreshRuntimeState()
+        WorkspaceSyncManager.requestSync(this, verifyBothSides = false)
     }
 
     private fun refreshRuntimeState() {
@@ -297,6 +323,7 @@ private fun HomeScreen(
     setupMessage: String,
     transferRunning: Boolean,
     transferMessage: String?,
+    syncState: WorkspaceSyncManager.State,
     serverState: OmochiServerManager.State,
     onSetup: () -> Unit,
     onOpenWorkbench: () -> Unit,
@@ -305,6 +332,9 @@ private fun HomeScreen(
     onImportFiles: () -> Unit,
     onImportFolder: () -> Unit,
     onExport: () -> Unit,
+    onLinkFolder: () -> Unit,
+    onSyncNow: () -> Unit,
+    onDisconnectFolder: () -> Unit,
     onLegal: () -> Unit,
 ) {
     Box(
@@ -348,9 +378,13 @@ private fun HomeScreen(
                 QuickActionsPanel(
                     transferRunning = transferRunning,
                     transferMessage = transferMessage,
+                    syncState = syncState,
                     onImportFiles = onImportFiles,
                     onImportFolder = onImportFolder,
                     onExport = onExport,
+                    onLinkFolder = onLinkFolder,
+                    onSyncNow = onSyncNow,
+                    onDisconnectFolder = onDisconnectFolder,
                 )
             }
 
@@ -661,9 +695,13 @@ private fun SectionHeading(title: String, subtitle: String) {
 private fun QuickActionsPanel(
     transferRunning: Boolean,
     transferMessage: String?,
+    syncState: WorkspaceSyncManager.State,
     onImportFiles: () -> Unit,
     onImportFolder: () -> Unit,
     onExport: () -> Unit,
+    onLinkFolder: () -> Unit,
+    onSyncNow: () -> Unit,
+    onDisconnectFolder: () -> Unit,
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = OmochiColors.Surface),
@@ -673,6 +711,13 @@ private fun QuickActionsPanel(
             .border(1.dp, OmochiColors.Border, RoundedCornerShape(24.dp)),
     ) {
         Column {
+            WorkspaceSyncSection(
+                state = syncState,
+                onLinkFolder = onLinkFolder,
+                onSyncNow = onSyncNow,
+                onDisconnect = onDisconnectFolder,
+            )
+            HorizontalDivider(color = OmochiColors.Divider)
             QuickActionRow(
                 icon = Icons.Outlined.FileOpen,
                 title = "ファイルを取り込む",
@@ -707,6 +752,186 @@ private fun QuickActionsPanel(
             }
         }
     }
+}
+
+@Composable
+private fun WorkspaceSyncSection(
+    state: WorkspaceSyncManager.State,
+    onLinkFolder: () -> Unit,
+    onSyncNow: () -> Unit,
+    onDisconnect: () -> Unit,
+) {
+    val link = when (state) {
+        WorkspaceSyncManager.State.Disconnected -> null
+        is WorkspaceSyncManager.State.Ready -> state.link
+        is WorkspaceSyncManager.State.Syncing -> state.link
+        is WorkspaceSyncManager.State.Failed -> state.link
+    }
+    if (link == null) {
+        QuickActionRow(
+            icon = Icons.Outlined.Sync,
+            title = "端末フォルダをリアルタイム連携",
+            detail = "選択したフォルダへ保存内容を双方向同期",
+            enabled = state !is WorkspaceSyncManager.State.Syncing,
+            onClick = onLinkFolder,
+        )
+        if (state is WorkspaceSyncManager.State.Failed) {
+            Text(
+                state.message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+            )
+        }
+        return
+    }
+
+    val syncing = state is WorkspaceSyncManager.State.Syncing
+    val statusText = when (state) {
+        is WorkspaceSyncManager.State.Ready -> {
+            val summary = state.summary
+            when {
+                summary == null -> "自動同期を待機しています"
+                summary.changed == 0 -> "${formatSyncTime(state.lastSyncedAt)} 同期済み・変更なし"
+                else -> buildString {
+                    append(formatSyncTime(state.lastSyncedAt))
+                    append(" 同期済み")
+                    if (summary.imported > 0) append("・取込${summary.imported}")
+                    if (summary.exported > 0) append("・書込${summary.exported}")
+                    if (summary.deletedLocal + summary.deletedRemote > 0) {
+                        append("・削除${summary.deletedLocal + summary.deletedRemote}")
+                    }
+                    if (summary.conflicts > 0) append("・競合${summary.conflicts}")
+                }
+            }
+        }
+        is WorkspaceSyncManager.State.Syncing -> state.message
+        is WorkspaceSyncManager.State.Failed -> state.message
+        WorkspaceSyncManager.State.Disconnected -> "未連携"
+    }
+
+    Column(Modifier.padding(horizontal = 16.dp, vertical = 15.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(46.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(
+                        if (state is WorkspaceSyncManager.State.Failed) {
+                            Color(0xFFF7E0DC)
+                        } else {
+                            Color(0xFFDDEEDC)
+                        }
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Outlined.Sync,
+                    contentDescription = null,
+                    tint = if (state is WorkspaceSyncManager.State.Failed) {
+                        OmochiColors.Red
+                    } else {
+                        Color(0xFF27833B)
+                    },
+                    modifier = Modifier.size(23.dp),
+                )
+            }
+            Column(Modifier.weight(1f).padding(start = 13.dp)) {
+                Text(link.label, style = MaterialTheme.typography.titleMedium, color = OmochiColors.Ink)
+                Text(
+                    "${link.workspacePath} ⇄ 端末",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = OmochiColors.Muted,
+                )
+                Text(
+                    statusText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (state is WorkspaceSyncManager.State.Failed) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        OmochiColors.Muted
+                    },
+                    modifier = Modifier.padding(top = 3.dp),
+                )
+            }
+            StatusPill(
+                text = if (syncing) "同期中" else if (state is WorkspaceSyncManager.State.Failed) "要確認" else "自動同期",
+                color = if (state is WorkspaceSyncManager.State.Failed) Color(0xFFF7E0DC) else Color(0xFFDDEEDC),
+                ink = if (state is WorkspaceSyncManager.State.Failed) OmochiColors.Red else Color(0xFF237437),
+            )
+        }
+
+        if (syncing) {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                color = OmochiColors.Accent,
+            )
+        }
+
+        if (state is WorkspaceSyncManager.State.Ready) {
+            state.summary?.let { summary ->
+                if (summary.conflicts > 0) {
+                    Text(
+                        "同時編集した端末側の版を .device-conflict-日時 付きで両側に保存しました。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OmochiColors.Yellow,
+                        modifier = Modifier.padding(top = 10.dp),
+                    )
+                }
+                summary.recoveryPath?.let { recovery ->
+                    Text(
+                        "削除・置換前の回復コピー: $recovery",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OmochiColors.Muted,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+            }
+        }
+
+        FlowRow(
+            modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Button(
+                onClick = onSyncNow,
+                enabled = !syncing,
+                modifier = Modifier.height(48.dp),
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Icon(Icons.Outlined.Sync, contentDescription = null, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(7.dp))
+                Text("今すぐ同期")
+            }
+            if (state is WorkspaceSyncManager.State.Failed) {
+                OutlinedButton(
+                    onClick = onLinkFolder,
+                    enabled = !syncing,
+                    modifier = Modifier.height(48.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Text("選び直す")
+                }
+            }
+            OutlinedButton(
+                onClick = onDisconnect,
+                enabled = !syncing,
+                modifier = Modifier.height(48.dp),
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Icon(Icons.Outlined.LinkOff, contentDescription = null, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(7.dp))
+                Text("連携解除")
+            }
+        }
+    }
+}
+
+private fun formatSyncTime(timestamp: Long): String = if (timestamp <= 0L) {
+    ""
+} else {
+    SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(timestamp))
 }
 
 @Composable

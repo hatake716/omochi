@@ -57,6 +57,8 @@ class WorkspaceTransferTest {
     @Test
     fun exportExcludesGitMetadataButKeepsWorkingFiles() {
         assertTrue(WorkspaceTransfer.isExcludedExportEntry(File("/workspace/.git")))
+        assertTrue(WorkspaceTransfer.isExcludedExportEntry(File("/workspace/Omochi-Recovery")))
+        assertTrue(WorkspaceTransfer.isExcludedExportEntry(File("/workspace/.omochi-sync-tmp-123")))
         assertFalse(WorkspaceTransfer.isExcludedExportEntry(File("/workspace/.gitignore")))
         assertFalse(WorkspaceTransfer.isExcludedExportEntry(File("/workspace/src")))
     }

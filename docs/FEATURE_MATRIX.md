@@ -26,6 +26,8 @@ Status legend:
 | Git clone/status/diff/stage/commit/branch | Upstream / device pending | Git and OpenSSH client installed during setup |
 | Git pull/push | Conditional | Requires network and user-provided remote credentials |
 | Settings / keybindings / workspace settings | Upstream / device verified | Japanese Settings UI opened; values remain in the app-private rootfs |
+| Three-line application menu | Implemented + upstream / Pixel 10a smoke verified | Open Folder and Close route to Android actions without a hidden quick input; New Window reuses the visible workbench; the menu remains pinned when Explorer/terminal minimum widths overflow; unsupported extension/sign-out rows are removed |
+| Working-folder switch and persistence | Implemented / Pixel 10a verified | Native touch picker created and selected a disposable `/workspace` descendant; code-server restarted on it, and cold launcher restart restored it before Close Folder reset the root |
 | Japanese workbench UI | Implemented / device verified | Official Microsoft language pack; Explorer, Settings, commands, trust dialog, and terminal labels observed in Japanese |
 | Claude Code | Implemented / device verified + conditional | Signed stable APT install and version self-test passed; first account login remains a user action |
 | Claude browser authentication continuity | Implemented / 60-second device smoke verified | Pixel 10a retained the same app, PRoot, code-server, terminal, and WebSocket session during an external HTTPS handoff; account login and the five-minute soak remain manual acceptance boundaries |
@@ -36,6 +38,8 @@ Status legend:
 | Hardware keyboard | Implemented / device pending | WebView receives native key events |
 | File import | Implemented | SAF files or folder; collision-safe names, no overwrite |
 | Workspace export | Implemented | New timestamped SAF folder on every export; symlinks/out-of-workspace targets are rejected |
+| Persisted device-folder access | Implemented / device pending | One active user-selected SAF tree; read/write grant survives restart and is released on unlink; no all-files permission |
+| Real-time bidirectional editing | Implemented / device pending | Private `/workspace/phone` mirror; FileObserver + ContentObserver + periodic verification; conflict copies and pre-delete recovery |
 | Offline work after setup | Conditional | Core IDE works locally; Git remotes/package installs still need their own network |
 | External extension marketplace | Excluded | Product gallery removed and Extensions Activity hidden; managed Japanese display pack is the only explicit exception |
 | Manually installed VSIX support | Not guaranteed | Not a supported/tested product capability |
@@ -80,3 +84,5 @@ The following broader interactions remain release-level acceptance items:
 5. Claude login browser launch, at least a five-minute browser foreground interval, return to the same terminal,
    and completion of the callback without a new PRoot process.
 6. Large repositories, long-running tasks, and project-specific debuggers/toolchains.
+7. Persisted SAF permission after reboot, local-to-device and device-to-local latency, concurrent edit conflicts,
+   delete recovery, provider-specific rename behavior, and explicit unlink across local and cloud document providers.

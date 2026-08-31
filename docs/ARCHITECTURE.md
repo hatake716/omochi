@@ -23,7 +23,7 @@ Kotlin and Jetpack Compose. It owns:
 - the macOS-like window chrome;
 - touch shortcuts and modifier latching;
 - Android IME and hardware-key dispatch into WebView;
-- SAF import/export;
+- SAF import/export and persisted bidirectional folder mirroring;
 - a user-visible foreground service for the loopback process lifecycle;
 - legal/source disclosure.
 
@@ -74,7 +74,7 @@ Omochi starts it with these important properties:
 - user data `/root/.local/share/omochi`;
 - locale `ja` plus a product-managed Microsoft Japanese Language Pack in the user extension directory;
 - `EXTENSIONS_GALLERY={}` plus removal of `extensionsGallery` from `product.json`;
-- startup folder `/workspace`.
+- startup folder selected under `/workspace` (default `/workspace`), persisted across service/app recreation.
 
 The code-server CLI extracts the language-pack VSIX but does not create VS Code's pre-start localization
 cache in this headless installation path. Omochi validates every declared translation path, writes the same
@@ -85,6 +85,15 @@ without enabling an extension marketplace.
 The WebView communicates through HTTP and WebSocket. It allows only the exact active loopback host/port to
 stay inside the app; HTTP(S) and mail links to other hosts are handed to Android. On the branded local login
 page, Android injects the private password and submits the form so the user never handles server credentials.
+Code - OSS implements Open Folder, Open Recent, New Window, and related menu actions with browser popup
+navigation. Omochi classifies every popup: the initial `about:blank` may bootstrap, the exact active loopback
+origin is adopted by the one visible workbench, external HTTP(S)/mail is handed to Android, and every other
+scheme is blocked. A close-window request on the main WebView returns to the Android dashboard instead of
+destroying the renderer behind Compose. Dynamic menu rows are enlarged for touch after every menu creation;
+extension-install commands and code-server sign-out are removed because this build deliberately has no
+extension marketplace and immediately restores its app-private local authentication. Native menu commands use
+an exact-origin-checked JavaScript prompt bridge rather than navigation, so Code - OSS's before-unload setting
+cannot intercept Open Folder, Close Folder, or Quit before Android handles them.
 
 ## 3. Setup transaction
 
@@ -135,7 +144,7 @@ app-owned PRoot tree, including code-server, extension-host, and terminal descen
 can start.
 
 If the app process is reclaimed despite foreground importance, the sticky service recreates the local server
-against the same app-private user data and `/workspace`. An Activity or WebView recreation reconnects to the
+against the same app-private user data and persisted `/workspace` subfolder. An Activity or WebView recreation reconnects to the
 manager's current URL instead of owning the server lifetime. The service never changes the network boundary:
 code-server still binds only the dynamically selected `127.0.0.1` port.
 
@@ -150,6 +159,34 @@ files/workspace/  <->  /workspace in Ubuntu
 This avoids broad shared-storage permissions. Import uses `ACTION_OPEN_DOCUMENT` or
 `ACTION_OPEN_DOCUMENT_TREE`. Existing items are never overwritten; a collision receives an ` (import N)`
 suffix. Export creates a new `Omochi-workspace-YYYYMMDD-HHmmss` folder, so it cannot replace an older backup.
+
+`WorkspaceSession` accepts only normalized guest folders at or below `/workspace`, resolves the corresponding
+host path back under `files/workspace`, and persists the selection only when the directory exists. The native
+48dp folder picker lists and creates subfolders without exposing the rootfs. A trusted Code - OSS navigation
+with `?folder=` passes through the same validator, so the upstream File menu and the native picker share one
+selection and the next code-server launch uses it as both CLI target and browser URL.
+The injected menu bridge is intentionally finite and origin-gated: Open Folder uses that picker, Open Local
+Folder launches Android's SAF tree selector and opens its mirror after the initial sync, Close Folder returns
+to `/workspace`, and Quit/Exit stops the visible IDE session. Other workbench commands remain upstream.
+
+For continuous editing, the user explicitly selects one SAF tree and Omochi persists only that tree's read and
+write grant. The mirror is stored at `files/workspace/phone/<name>` and therefore appears inside Ubuntu as
+`/workspace/phone/<name>`. PRoot never receives the tree URI or a raw `/storage/emulated/0` path: Android's
+`ContentResolver` is the only component that opens provider content.
+
+Local FileObserver events are debounced for 450 ms. Recursive observers are rebuilt after a successful sync so
+new directories are covered. Provider ContentObserver notifications request an immediate remote verification;
+a three-second metadata scan and a 30-second forced content-hash check cover providers with incomplete event or
+timestamp behavior. A persisted SHA-256 baseline distinguishes one-sided edits, deletions, and true concurrent
+changes without hashing every unchanged file on every scan.
+
+One-sided edits flow to the other side. An unmodified counterpart accepts a deletion, while an edit concurrent
+with a deletion wins and recreates the missing copy. If both file versions changed, Omochi keeps the local version
+at the original path and writes the provider version beside it as `.device-conflict-<timestamp>` on both sides.
+Files removed or type-replaced by an unambiguous sync are copied first to `/workspace/Omochi-Recovery`.
+Symlinks fail closed, and `.git`, sync temporary files, and recovery content are excluded from the SAF mirror.
+Unlinking releases the persisted URI grant and leaves the private mirror in place so it is not a delete action.
+The current UI maintains one active tree link; switching links preserves the previous private mirror.
 
 The app does not access another application's Termux prefix or data directory.
 
@@ -174,10 +211,11 @@ workbench root consumes the IME inset while the redundant touch-key panel and na
 editor and terminal are therefore resized above the keyboard instead of being covered. On phone-width viewports
 the restored primary and auxiliary sidebars are initially collapsed; the fixed dock opens them on demand.
 
-A bounded CSS/DOM layer increases Code list rows, tabs, action icons, menus, buttons, quick-pick rows, status
+A bounded CSS/DOM layer increases Code list rows, tabs, the three-line application menu, action icons, menu
+rows, buttons, quick-pick rows, status
 bar, and scrollbars for touch. Extension hiding uses a short bounded scan after load rather than an unbounded
-whole-document mutation scan. The WebView supports user-initiated popup links but routes every non-loopback
-HTTP(S)/mail target through Android, including Claude authentication pages.
+whole-document mutation scan. Trusted menu popups reuse the current workbench, while every non-loopback
+HTTP(S)/mail target routes through Android, including Claude authentication pages.
 
 ## 7. Security decisions
 

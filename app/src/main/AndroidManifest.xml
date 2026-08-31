@@ -31,7 +31,7 @@
             android:stopWithTask="false">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="User-started loopback IDE and terminal session kept alive while an external authentication browser is visible" />
+                android:value="User-started loopback IDE, terminal, and persisted SAF workspace synchronization kept alive while editing or using an external authentication browser" />
         </service>
 
         <activity

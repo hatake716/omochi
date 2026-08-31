@@ -22,7 +22,12 @@ Use GitHub's private vulnerability reporting feature for `hatake716/omochi` when
 - Android framework/WebView cleartext networking is allowed only for loopback in Network Security Config;
 - downloaded Ubuntu and code-server archives have pinned SHA-256 values;
 - PRoot does not grant Android root privileges;
-- workspace files stay in app-private storage unless the user explicitly imports/exports through SAF;
+- workspace files stay in app-private storage unless the user explicitly imports/exports or persistently links
+  a selected SAF tree; a link grants read/write access only to that user-selected tree and is released when unlinked;
+- linked SAF trees are mirrored through ContentResolver into app-private `/workspace/phone`; PRoot never receives a
+  raw shared-storage path or `content://` capability, and the app does not request all-files access;
+- sync refuses symlinks, excludes `.git`, preserves concurrent remote edits under conflict names, and writes
+  pre-delete recovery copies under app-private `/workspace/Omochi-Recovery`;
 - external Extension Gallery access is disabled and not part of the supported product;
 - no API key, Git credential, signing key, or user token belongs in this repository.
 

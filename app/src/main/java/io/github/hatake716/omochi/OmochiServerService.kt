@@ -32,6 +32,7 @@ class OmochiServerService : Service() {
         createNotificationChannel()
         promoteToForeground(OmochiServerManager.state())
         OmochiServerManager.addListener(stateListener)
+        WorkspaceSyncManager.start(applicationContext)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -72,6 +73,7 @@ class OmochiServerService : Service() {
 
     override fun onDestroy() {
         OmochiServerManager.removeListener(stateListener)
+        WorkspaceSyncManager.stop()
         // Never leave an unmanaged PRoot child behind if the service is explicitly
         // stopped. Process death does not normally dispatch this callback.
         OmochiServerManager.stop()

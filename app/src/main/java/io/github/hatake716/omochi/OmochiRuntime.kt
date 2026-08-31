@@ -548,6 +548,7 @@ object OmochiRuntime {
         check(isInstalled(context)) { "Omochiの初回セットアップが完了していません。" }
         require(port in 1024..65535) { "無効なloopbackポートです: $port" }
         val password = authPassword(context)
+        val workspaceFolder = WorkspaceSession.selectedGuestFolder(context)
 
         val args = baseProotArgs(context, rootfs).toMutableList()
         args += listOf(
@@ -578,7 +579,7 @@ object OmochiRuntime {
             "--welcome-text", "Omochi ローカルワークベンチ",
             "--user-data-dir", "/root/.local/share/omochi",
             "--extensions-dir", "/root/.local/share/omochi/extensions",
-            "/workspace"
+            workspaceFolder
         )
 
         val proot = ensureHostRuntime(context).getOrThrow()
@@ -589,14 +590,12 @@ object OmochiRuntime {
             env = hostEnvironment(context, rootfs, verbose = false)
                 .map { "${it.key}=${it.value}" }
                 .toTypedArray(),
-            title = "Omochi — /workspace"
+            title = "Omochi — $workspaceFolder"
         )
     }
 
-    fun serverUrl(port: Int): String {
-        require(port in 1024..65535) { "Invalid loopback port: $port" }
-        return "http://127.0.0.1:$port/?folder=/workspace"
-    }
+    fun serverUrl(port: Int, guestFolder: String = WorkspaceSession.GUEST_ROOT): String =
+        WorkspaceSession.buildWorkbenchUrl(port, guestFolder)
 
     internal fun authPassword(context: Context): String = synchronized(authLock) {
         val file = File(runtimeDir(context), AUTH_FILE)
