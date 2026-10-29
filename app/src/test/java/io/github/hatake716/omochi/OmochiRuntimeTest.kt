@@ -78,6 +78,101 @@ class OmochiRuntimeTest {
     }
 
     @Test
+    fun seccompFastPathLeavesProotNoSeccompUnset() {
+        val environment = prootEnvironment(seccomp = true, verbose = false)
+
+        assertFalse(environment.containsKey("PROOT_NO_SECCOMP"))
+        assertFalse(environment.containsKey("PROOT_VERBOSE"))
+        assertEquals("/data/user/0/app/files/embedded-runtime/tmp", environment["PROOT_TMP_DIR"])
+        assertEquals("/data/app/lib/arm64/libproot-loader.so", environment["PROOT_LOADER"])
+        assertEquals("/data/app/lib/arm64", environment["LD_LIBRARY_PATH"])
+        assertEquals("/rootfs/.l2s", environment["PROOT_L2S_DIR"])
+    }
+
+    @Test
+    fun ptraceOnlyModeSetsProotNoSeccomp() {
+        val environment = prootEnvironment(seccomp = false, verbose = true)
+
+        assertEquals("1", environment["PROOT_NO_SECCOMP"])
+        assertEquals("9", environment["PROOT_VERBOSE"])
+        // PROOT_NO_SECCOMP 以外は seccomp の有無で変わらない。
+        assertEquals(
+            prootEnvironment(seccomp = true, verbose = true),
+            environment.filterKeys { it != "PROOT_NO_SECCOMP" },
+        )
+    }
+
+    @Test
+    fun hostOnlyEnvironmentHasNoLinkToSymlinkDirectory() {
+        val environment = OmochiRuntime.prootHostEnvironment(
+            home = "/home",
+            tempDir = "/tmp",
+            loader = "/loader",
+            libraryPath = "/lib",
+            l2sDir = null,
+            seccomp = true,
+            verbose = false,
+        )
+
+        assertFalse(environment.containsKey("PROOT_L2S_DIR"))
+        assertEquals(
+            listOf(
+                "HOME", "TMPDIR", "PROOT_TMP_DIR", "PROOT_LOADER", "LD_LIBRARY_PATH",
+                "PATH", "ANDROID_DATA", "ANDROID_ROOT", "TERM",
+            ),
+            environment.keys.toList(),
+        )
+    }
+
+    @Test
+    fun shortDiagnosticsAreKeptVerbatim() {
+        val output = "line\n".repeat(100)
+
+        assertEquals(output, OmochiRuntime.boundedDiagnostic(output, 8 * 1024, "/logs/x.log"))
+    }
+
+    @Test
+    fun longDiagnosticsKeepHeadAndTailWithinTheLimit() {
+        val output = "HEAD-MARKER\n" + "verbose trace line\n".repeat(50_000) + "fatal: execve failed\n"
+
+        val bounded = OmochiRuntime.boundedDiagnostic(
+            output,
+            OmochiRuntime.UI_DIAGNOSTIC_LIMIT,
+            "/data/files/logs/proot-self-test.log",
+        )
+
+        assertTrue(bounded.startsWith("HEAD-MARKER\n"))
+        assertTrue(bounded.endsWith("fatal: execve failed\n"))
+        assertTrue("/data/files/logs/proot-self-test.log" in bounded)
+        assertTrue(bounded.length <= OmochiRuntime.UI_DIAGNOSTIC_LIMIT + 200)
+        val tailLength = OmochiRuntime.UI_DIAGNOSTIC_LIMIT - 1_024
+        assertTrue(bounded.endsWith(output.takeLast(tailLength)))
+    }
+
+    @Test
+    fun diagnosticsNeverSplitSurrogatePairs() {
+        val output = "😀".repeat(10_000)
+
+        val bounded = OmochiRuntime.boundedDiagnostic(output, 1_000, null)
+
+        bounded.forEachIndexed { index, c ->
+            if (c.isHighSurrogate()) assertTrue(bounded[index + 1].isLowSurrogate())
+            if (c.isLowSurrogate()) assertTrue(bounded[index - 1].isHighSurrogate())
+        }
+    }
+
+    private fun prootEnvironment(seccomp: Boolean, verbose: Boolean) =
+        OmochiRuntime.prootHostEnvironment(
+            home = "/data/user/0/app/files",
+            tempDir = "/data/user/0/app/files/embedded-runtime/tmp",
+            loader = "/data/app/lib/arm64/libproot-loader.so",
+            libraryPath = "/data/app/lib/arm64",
+            l2sDir = "/rootfs/.l2s",
+            seccomp = seccomp,
+            verbose = verbose,
+        )
+
+    @Test
     fun markerParserIgnoresCommentsAndMalformedRows() {
         assertEquals(
             mapOf(

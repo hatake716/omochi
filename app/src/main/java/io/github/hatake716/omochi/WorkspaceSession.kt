@@ -6,6 +6,7 @@ import java.io.File
 import java.net.URI
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.nio.file.Paths
 
 /**
@@ -13,6 +14,9 @@ import java.nio.file.Paths
  *
  * A guest path is never converted into an arbitrary host path. Every accepted value
  * must stay below [GUEST_ROOT], which is the only writable tree bound into PRoot.
+ *
+ * Everything except the pure helpers touches the file system. Call it off the main
+ * thread; listing a large folder such as node_modules can take noticeable time.
  */
 object WorkspaceSession {
     const val GUEST_ROOT = "/workspace"
@@ -27,53 +31,47 @@ object WorkspaceSession {
     private const val SELECTED_FOLDER = "selected-guest-folder-v1"
 
     fun selectedGuestFolder(context: Context): String {
-        val saved = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-            .getString(SELECTED_FOLDER, null)
-        return resolveFolder(context, saved).getOrNull()?.guestPath ?: GUEST_ROOT
+        val saved = preferences(context).getString(SELECTED_FOLDER, null)
+        return existingFolderIn(workspaceRoot(context), saved) ?: GUEST_ROOT
     }
 
+    /**
+     * Persists an explicit user choice. This is followed by a code-server restart that
+     * reads the value back, so it is committed before returning.
+     */
     fun selectFolder(context: Context, guestPath: String): Result<Folder> = runCatching {
-        val folder = resolveFolder(context, guestPath).getOrThrow()
-        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit(commit = true) {
-            putString(SELECTED_FOLDER, folder.guestPath)
+        val folder = resolveFolderIn(workspaceRoot(context), guestPath)
+        val preferences = preferences(context)
+        if (folderToPersist(preferences.getString(SELECTED_FOLDER, null), folder.guestPath) != null) {
+            preferences.edit(commit = true) { putString(SELECTED_FOLDER, folder.guestPath) }
         }
         folder
     }
 
-    /** Persist a folder selected by Code - OSS itself after a trusted navigation. */
-    fun captureFolderFromUrl(context: Context, url: String): Folder? {
-        val guestPath = folderFromWorkbenchUrl(url) ?: return null
-        return selectFolder(context, guestPath).getOrNull()
+    /**
+     * Persist a folder selected by Code - OSS itself after a trusted navigation and
+     * return the folder that is now selected, or null when the URL names none.
+     *
+     * Navigations inside the workbench repeat the same folder most of the time, so an
+     * unchanged value costs neither file system access nor a preferences write. The
+     * next server start reads the value in-process, where apply() is already visible.
+     */
+    fun captureFolderFromUrl(context: Context, url: String): String? {
+        val candidate = folderFromWorkbenchUrl(url) ?: return null
+        val preferences = preferences(context)
+        val changed = folderToPersist(preferences.getString(SELECTED_FOLDER, null), candidate)
+            ?: return candidate
+        val existing = existingFolderIn(workspaceRoot(context), changed) ?: return null
+        preferences.edit { putString(SELECTED_FOLDER, existing) }
+        return existing
     }
 
     fun resolveFolder(context: Context, guestPath: String?): Result<Folder> = runCatching {
-        val normalized = normalizeGuestFolder(guestPath)
-            ?: error("作業フォルダーは $GUEST_ROOT 内から選択してください。")
-        val host = hostFolder(context, normalized)
-        check(host.isDirectory) { "フォルダーが存在しません: $normalized" }
-        Folder(
-            guestPath = normalized,
-            displayName = if (normalized == GUEST_ROOT) "workspace" else host.name,
-            hasChildren = host.listFiles().orEmpty().any { it.isDirectory },
-        )
+        resolveFolderIn(workspaceRoot(context), guestPath)
     }
 
     fun listFolders(context: Context, parentGuestPath: String): Result<List<Folder>> = runCatching {
-        val parent = resolveFolder(context, parentGuestPath).getOrThrow()
-        val parentHost = hostFolder(context, parent.guestPath)
-        parentHost.listFiles().orEmpty()
-            .asSequence()
-            .filter { it.isDirectory }
-            .mapNotNull { child ->
-                val guestPath = guestPathFor(context, child) ?: return@mapNotNull null
-                Folder(
-                    guestPath = guestPath,
-                    displayName = child.name,
-                    hasChildren = child.listFiles().orEmpty().any { it.isDirectory },
-                )
-            }
-            .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.displayName })
-            .toList()
+        listFoldersIn(workspaceRoot(context), parentGuestPath)
     }
 
     fun createFolder(
@@ -81,15 +79,7 @@ object WorkspaceSession {
         parentGuestPath: String,
         requestedName: String,
     ): Result<Folder> = runCatching {
-        val parent = resolveFolder(context, parentGuestPath).getOrThrow()
-        val name = requestedName.trim()
-        require(isValidFolderName(name)) {
-            "フォルダー名には /、\\、制御文字、.、.. を使用できません。"
-        }
-        val host = File(hostFolder(context, parent.guestPath), name)
-        check(!host.exists()) { "同名のファイルまたはフォルダーが既にあります。" }
-        check(host.mkdir()) { "フォルダーを作成できませんでした。" }
-        resolveFolder(context, guestPathFor(context, host)).getOrThrow()
+        createFolderIn(workspaceRoot(context), parentGuestPath, requestedName)
     }
 
     fun parentGuestFolder(guestPath: String): String? {
@@ -105,6 +95,17 @@ object WorkspaceSession {
         }.getOrNull() ?: return null
         if (normalized != GUEST_ROOT && !normalized.startsWith("$GUEST_ROOT/")) return null
         return normalized.trimEnd('/').ifBlank { GUEST_ROOT }
+    }
+
+    /**
+     * The value to store when [candidate] is captured while [saved] is stored, or null
+     * when nothing has to be written. A missing value means [GUEST_ROOT].
+     */
+    internal fun folderToPersist(saved: String?, candidate: String?): String? {
+        val normalized = normalizeGuestFolder(candidate) ?: return null
+        if (normalized == saved) return null
+        if (saved == null && normalized == GUEST_ROOT) return null
+        return normalized
     }
 
     internal fun folderFromWorkbenchUrl(url: String): String? = runCatching {
@@ -136,8 +137,75 @@ object WorkspaceSession {
             name != ".." &&
             name.none { it == '/' || it == '\\' || it == '\u0000' || it.code < 0x20 }
 
-    private fun hostFolder(context: Context, guestPath: String): File {
-        val root = OmochiRuntime.workspaceDir(context).apply { mkdirs() }.canonicalFile
+    /** [root] must be canonical, as returned by [workspaceRoot]. */
+    internal fun resolveFolderIn(root: File, guestPath: String?): Folder {
+        val normalized = normalizeGuestFolder(guestPath)
+            ?: error("作業フォルダーは $GUEST_ROOT 内から選択してください。")
+        val host = hostFolder(root, normalized)
+        check(host.isDirectory) { "フォルダーが存在しません: $normalized" }
+        return Folder(
+            guestPath = normalized,
+            displayName = if (normalized == GUEST_ROOT) "workspace" else host.name,
+            hasChildren = hasChildFolder(host),
+        )
+    }
+
+    internal fun listFoldersIn(root: File, parentGuestPath: String): List<Folder> {
+        val parent = resolveFolderIn(root, parentGuestPath)
+        val parentHost = hostFolder(root, parent.guestPath)
+        return parentHost.listFiles().orEmpty()
+            .asSequence()
+            .filter { it.isDirectory }
+            .mapNotNull { child ->
+                val guestPath = guestPathFor(root, child) ?: return@mapNotNull null
+                Folder(
+                    guestPath = guestPath,
+                    displayName = child.name,
+                    hasChildren = hasChildFolder(child),
+                )
+            }
+            .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.displayName })
+            .toList()
+    }
+
+    internal fun createFolderIn(root: File, parentGuestPath: String, requestedName: String): Folder {
+        val parent = resolveFolderIn(root, parentGuestPath)
+        val name = requestedName.trim()
+        require(isValidFolderName(name)) {
+            "フォルダー名には /、\\、制御文字、.、.. を使用できません。"
+        }
+        val host = File(hostFolder(root, parent.guestPath), name)
+        check(!host.exists()) { "同名のファイルまたはフォルダーが既にあります。" }
+        check(host.mkdir()) { "フォルダーを作成できませんでした。" }
+        return resolveFolderIn(root, guestPathFor(root, host))
+    }
+
+    /**
+     * Whether [directory] contains at least one folder. The picker only needs a yes/no
+     * per row, so stop at the first hit instead of materialising every child as
+     * listFiles() does; that matters for rows such as node_modules.
+     */
+    internal fun hasChildFolder(directory: File): Boolean = runCatching {
+        Files.newDirectoryStream(directory.toPath()).use { entries ->
+            entries.any { Files.isDirectory(it) }
+        }
+    }.getOrDefault(false)
+
+    /** Validated guest path of an existing folder, without listing its contents. */
+    private fun existingFolderIn(root: File, guestPath: String?): String? {
+        val normalized = normalizeGuestFolder(guestPath) ?: return null
+        val host = runCatching { hostFolder(root, normalized) }.getOrNull() ?: return null
+        return normalized.takeIf { host.isDirectory }
+    }
+
+    private fun preferences(context: Context) =
+        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+
+    /** Canonical host directory behind [GUEST_ROOT]. Resolve it once per operation. */
+    private fun workspaceRoot(context: Context): File =
+        OmochiRuntime.workspaceDir(context).apply { mkdirs() }.canonicalFile
+
+    private fun hostFolder(root: File, guestPath: String): File {
         val relative = guestPath.removePrefix(GUEST_ROOT).trimStart('/')
         val target = if (relative.isEmpty()) root else File(root, relative).canonicalFile
         check(target.path == root.path || target.path.startsWith(root.path + File.separator)) {
@@ -146,8 +214,7 @@ object WorkspaceSession {
         return target
     }
 
-    private fun guestPathFor(context: Context, host: File): String? {
-        val root = OmochiRuntime.workspaceDir(context).apply { mkdirs() }.canonicalFile
+    private fun guestPathFor(root: File, host: File): String? {
         val candidate = host.absoluteFile
         if (candidate.path != root.path && !candidate.path.startsWith(root.path + File.separator)) {
             return null

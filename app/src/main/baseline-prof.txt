@@ -1,0 +1,3 @@
+# Omochi app code: compile everything ahead of time on install (non-debuggable builds only).
+HSPLio/github/hatake716/omochi/**->**(**)**
+Lio/github/hatake716/omochi/**;

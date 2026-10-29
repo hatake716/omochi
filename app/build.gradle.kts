@@ -158,6 +158,18 @@ android {
                 "proguard-rules.pro",
             )
         }
+        // Non-debuggable build for hands-on performance checks on a device that already
+        // runs the debug package. It keeps the debug applicationId and signing key, so an
+        // in-place update preserves the Linux rootfs and /workspace, while ART compiles the
+        // app (and its baseline profile) like a release build instead of a debuggable one.
+        create("optimized") {
+            initWith(getByName("debug"))
+            isDebuggable = false
+            isJniDebuggable = false
+            versionNameSuffix = "-optimized"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
     }
 
     packaging {

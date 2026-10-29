@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="omochi_window">#F4F1ED</color>
+    <!-- iOS systemGroupedBackground (light): matches the first Compose frame, so launch does not flash. -->
+    <color name="omochi_window">#F2F2F7</color>
 </resources>

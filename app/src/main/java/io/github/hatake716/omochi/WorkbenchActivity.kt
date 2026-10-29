@@ -2,12 +2,15 @@ package io.github.hatake716.omochi
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Message
 import android.os.SystemClock
 import android.util.Log
@@ -31,94 +34,55 @@ import android.webkit.WebViewClient
 import androidx.activity.BackEventCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.ime
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBars
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.AccountTree
-import androidx.compose.material.icons.outlined.ChevronRight
-import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.CreateNewFolder
-import androidx.compose.material.icons.outlined.FolderOpen
-import androidx.compose.material.icons.outlined.Fullscreen
-import androidx.compose.material.icons.outlined.FullscreenExit
-import androidx.compose.material.icons.outlined.Keyboard
-import androidx.compose.material.icons.outlined.KeyboardHide
-import androidx.compose.material.icons.outlined.MoreHoriz
-import androidx.compose.material.icons.outlined.PlayArrow
-import androidx.compose.material.icons.outlined.Refresh
-import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material.icons.outlined.Sync
-import androidx.compose.material.icons.outlined.Terminal
-import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import androidx.core.net.toUri
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import java.net.URI
+import java.util.concurrent.Executors
 import org.json.JSONObject
 
 class WorkbenchActivity : ComponentActivity() {
     companion object {
         const val EXTRA_OPEN_TERMINAL = "io.github.hatake716.omochi.extra.OPEN_TERMINAL"
+        private const val TAG = "OmochiWeb"
         private const val NATIVE_MENU_PROMPT = "omochi-native-menu-v1"
+        private const val TOUCH_LAYER_ASSET = "workbench/touch-layer.js"
+
+        /** The injected touch layer is immutable per APK, so read the asset once per process. */
+        @Volatile private var cachedTouchLayerScript: String? = null
+    }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** File system work of this screen (folder picker, folder capture, login secret). */
+    private val ioExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "OmochiWorkbenchIo")
     }
 
     private var webView: WebView? = null
+
+    /**
+     * URL loaded from the current server session. It is cleared whenever the session
+     * leaves Running (the page's server is gone) and by an explicit folder switch, so
+     * the next Running loads afresh; a Running published again for the same session
+     * leaves the live page, its WebSockets and terminals alone.
+     */
     private var loadedUrl: String? = null
+
+    /** URL handed to loadUrl() whose main frame has neither finished nor failed yet. */
+    private var pendingLoadUrl: String? = null
+
+    /** code-server password, read off the main thread before the login page appears. */
+    @Volatile private var loginPassword: String? = null
     private var serverState by mutableStateOf<OmochiServerManager.State>(
         OmochiServerManager.state()
     )
@@ -140,6 +104,24 @@ class WorkbenchActivity : ComponentActivity() {
     private var initialTerminalPending = false
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
     private val popupWebViews = mutableMapOf<WebView, Boolean>()
+
+    /**
+     * Set from a folder selection until the old server session ends. Pages of the old
+     * session may still report their folder meanwhile; saving that would race the new
+     * choice that the restart is about to read.
+     */
+    private var folderSwitchPending = false
+    private var folderSelectInFlight = false
+
+    /** Latest picker request; results of older (or dismissed) requests are dropped. */
+    private var pickerRequest = 0
+
+    /** Sync failure seen last (null after any other state) and the one the user closed. */
+    private var lastSyncFailure: String? = null
+    private var dismissedSyncFailure: String? = null
+
+    /** The banner text shown for a sync failure, paired with that failure's message. */
+    private var syncFailureNotice: Pair<String, String>? = null
 
     private val chooseWebFiles = registerForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
@@ -165,19 +147,38 @@ class WorkbenchActivity : ComponentActivity() {
     private val serverListener: (OmochiServerManager.State) -> Unit = { state ->
         serverState = state
         if (state is OmochiServerManager.State.Running) {
-            webError = null
             loadWorkbench(state.url)
+        } else {
+            // The page belongs to a server that is gone or being replaced.
+            loadedUrl = null
+            folderSwitchPending = false
         }
     }
 
     private val syncListener: (WorkspaceSyncManager.State) -> Unit = { state ->
         syncState = state
+        val previousFailure = lastSyncFailure
+        lastSyncFailure = (state as? WorkspaceSyncManager.State.Failed)?.message
         when (state) {
             is WorkspaceSyncManager.State.Failed -> {
                 openLinkedFolderAfterConnect = false
-                browserNotice = "端末フォルダ同期: ${state.message}"
+                // The sync worker retries a failure every few seconds. Announce it once
+                // per failure instead of re-opening a banner the user already closed.
+                if (WorkbenchSessionPolicy.shouldAnnounceSyncFailure(
+                        previousFailure = previousFailure,
+                        message = state.message,
+                        dismissedFailure = dismissedSyncFailure,
+                    )
+                ) {
+                    val notice = "端末フォルダ同期: ${state.message}"
+                    browserNotice = notice
+                    syncFailureNotice = notice to state.message
+                }
             }
+            WorkspaceSyncManager.State.Disconnected -> dismissedSyncFailure = null
+            is WorkspaceSyncManager.State.Syncing -> Unit
             is WorkspaceSyncManager.State.Ready -> {
+                dismissedSyncFailure = null
                 if (openLinkedFolderAfterConnect) {
                     openLinkedFolderAfterConnect = false
                     selectWorkspaceFolder(state.link.workspacePath)
@@ -188,7 +189,6 @@ class WorkbenchActivity : ComponentActivity() {
                         "同時編集を検出しました。端末側の版を日時付き競合ファイルとして保存しました。"
                 }
             }
-            else -> Unit
         }
     }
 
@@ -199,18 +199,26 @@ class WorkbenchActivity : ComponentActivity() {
             return
         }
 
-        enableEdgeToEdge()
+        // The chrome around the workbench is light, so both bars need dark icons.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(AndroidColor.TRANSPARENT, AndroidColor.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.light(AndroidColor.TRANSPARENT, AndroidColor.TRANSPARENT),
+        )
         syncState = WorkspaceSyncManager.state(this)
         workspaceFolder = WorkspaceSession.selectedGuestFolder(this)
         initialTerminalPending = intent.getBooleanExtra(EXTRA_OPEN_TERMINAL, false)
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         installBackHandler()
 
+        val appContext = applicationContext
+        runInBackground {
+            loginPassword = runCatching { OmochiRuntime.authPassword(appContext) }.getOrNull()
+        }
+
+        // The session itself is requested by onResume(), which also covers returning to
+        // this screen after the session was stopped elsewhere.
         OmochiServerManager.addListener(serverListener)
         WorkspaceSyncManager.addListener(syncListener)
-        OmochiServerService.start(this).onFailure {
-            webError = "IDEセッションを開始できません: ${it.message ?: it.javaClass.simpleName}"
-        }
 
         setContent {
             OmochiTheme {
@@ -234,7 +242,7 @@ class WorkbenchActivity : ComponentActivity() {
                     onBrowseWorkspaceFolder = ::browseWorkspaceFolder,
                     onCreateWorkspaceFolder = ::createWorkspaceFolder,
                     onSelectWorkspaceFolder = ::selectWorkspaceFolder,
-                    onDismissWorkspacePicker = { workspacePicker = null },
+                    onDismissWorkspacePicker = ::dismissWorkspacePicker,
                     onSyncFolder = ::handleSyncFolder,
                     onExplorer = { activateWorkbenchView("codicon-explorer-view-icon") },
                     onSearch = { activateWorkbenchView("codicon-search-view-icon") },
@@ -250,7 +258,7 @@ class WorkbenchActivity : ComponentActivity() {
                     onShortcut = ::handleNamedShortcut,
                     onShowIme = ::showIme,
                     browserNotice = browserNotice,
-                    onDismissBrowserNotice = { browserNotice = null },
+                    onDismissBrowserNotice = ::dismissBrowserNotice,
                 )
             }
         }
@@ -265,10 +273,17 @@ class WorkbenchActivity : ComponentActivity() {
             externalBrowserPending = false
             browserNotice = "ブラウザから戻りました。IDEとターミナルのセッションは継続しています。"
         }
-        if (OmochiServerManager.state() is OmochiServerManager.State.Failed) {
-            OmochiServerService.restart(this).onFailure {
+        when (OmochiServerManager.state()) {
+            // First start, or the session was stopped from the notification or the
+            // dashboard while this screen was hidden: a visible workbench needs one.
+            OmochiServerManager.State.Stopped -> OmochiServerService.start(this).onFailure {
+                browserNotice =
+                    "IDEセッションを開始できません: ${it.message ?: it.javaClass.simpleName}"
+            }
+            is OmochiServerManager.State.Failed -> OmochiServerService.restart(this).onFailure {
                 webError = "IDEセッションを再起動できません: ${it.message ?: it.javaClass.simpleName}"
             }
+            else -> Unit
         }
         WorkspaceSyncManager.requestSync(this, verifyBothSides = false)
     }
@@ -294,31 +309,58 @@ class WorkbenchActivity : ComponentActivity() {
         }
         webView = null
         popupWebViews.keys.toList().forEach(::destroyPopup)
+        // Queued work still finishes; its results are dropped because isDestroyed is set.
+        ioExecutor.shutdown()
         super.onDestroy()
+    }
+
+    private fun runInBackground(task: () -> Unit) {
+        runCatching { ioExecutor.execute(task) }
+            .onFailure { Log.w(TAG, "Workbench background task rejected", it) }
+    }
+
+    /** Applies a picker result on the main thread unless a newer request replaced it. */
+    private fun postPickerResult(request: Int, apply: () -> Unit) {
+        mainHandler.post {
+            if (!isDestroyed && request == pickerRequest) apply()
+        }
     }
 
     private fun openWorkspacePicker() {
         browseWorkspaceFolder(workspaceFolder)
     }
 
+    private fun dismissWorkspacePicker() {
+        pickerRequest += 1
+        workspacePicker = null
+    }
+
     private fun browseWorkspaceFolder(guestPath: String) {
-        val current = WorkspaceSession.resolveFolder(this, guestPath).getOrElse {
-            workspacePicker = WorkspacePickerState(
+        val request = ++pickerRequest
+        val appContext = applicationContext
+        runInBackground {
+            val next = loadWorkspacePicker(appContext, guestPath)
+            postPickerResult(request) { workspacePicker = next }
+        }
+    }
+
+    /** Reads one picker page. File system work: call it off the main thread. */
+    private fun loadWorkspacePicker(context: Context, guestPath: String): WorkspacePickerState {
+        val current = WorkspaceSession.resolveFolder(context, guestPath).getOrElse {
+            return WorkspacePickerState(
                 currentGuestPath = WorkspaceSession.GUEST_ROOT,
                 folders = emptyList(),
                 error = it.message ?: "作業フォルダーを読み込めませんでした。",
             )
-            return
         }
-        val folders = WorkspaceSession.listFolders(this, current.guestPath).getOrElse {
-            workspacePicker = WorkspacePickerState(
+        val folders = WorkspaceSession.listFolders(context, current.guestPath).getOrElse {
+            return WorkspacePickerState(
                 currentGuestPath = current.guestPath,
                 folders = emptyList(),
                 error = it.message ?: "フォルダー一覧を読み込めませんでした。",
             )
-            return
         }
-        workspacePicker = WorkspacePickerState(
+        return WorkspacePickerState(
             currentGuestPath = current.guestPath,
             folders = folders,
             error = null,
@@ -327,43 +369,83 @@ class WorkbenchActivity : ComponentActivity() {
 
     private fun createWorkspaceFolder(name: String) {
         val current = workspacePicker ?: return
-        WorkspaceSession.createFolder(this, current.currentGuestPath, name)
-            .onSuccess { created -> browseWorkspaceFolder(created.guestPath) }
-            .onFailure { error ->
-                workspacePicker = current.copy(
-                    error = error.message ?: "フォルダーを作成できませんでした。",
+        val request = ++pickerRequest
+        val appContext = applicationContext
+        runInBackground {
+            val next = WorkspaceSession.createFolder(appContext, current.currentGuestPath, name)
+                .fold(
+                    onSuccess = { created -> loadWorkspacePicker(appContext, created.guestPath) },
+                    onFailure = { error ->
+                        current.copy(error = error.message ?: "フォルダーを作成できませんでした。")
+                    },
                 )
-            }
+            postPickerResult(request) { workspacePicker = next }
+        }
     }
 
     private fun selectWorkspaceFolder(guestPath: String) {
-        WorkspaceSession.selectFolder(this, guestPath)
-            .onSuccess { selected ->
-                workspaceFolder = selected.guestPath
-                workspacePicker = null
-                loadedUrl = null
-                browserNotice = "作業フォルダーを ${selected.guestPath} に変更しています…"
-                OmochiServerService.restart(this).onFailure {
-                    browserNotice = "作業フォルダーは保存しましたが、IDEを再起動できませんでした。"
+        // The picker stays open until the choice is saved; ignore repeated taps meanwhile.
+        if (folderSelectInFlight) return
+        folderSelectInFlight = true
+        folderSwitchPending = true
+        val request = pickerRequest
+        val appContext = applicationContext
+        runInBackground {
+            // selectFolder commits, so the restart below always reads the new folder.
+            val result = WorkspaceSession.selectFolder(appContext, guestPath)
+            mainHandler.post {
+                folderSelectInFlight = false
+                result.onSuccess { selected ->
+                    // The choice is saved; switch even if this screen went away meanwhile.
+                    val restarted = OmochiServerService.restart(appContext)
+                    if (isDestroyed) return@post
+                    pickerRequest += 1
+                    workspaceFolder = selected.guestPath
+                    workspacePicker = null
+                    loadedUrl = null
+                    if (restarted.isSuccess) {
+                        browserNotice = "作業フォルダーを ${selected.guestPath} に変更しています…"
+                    } else {
+                        folderSwitchPending = false
+                        browserNotice = "作業フォルダーは保存しましたが、IDEを再起動できませんでした。"
+                    }
+                }.onFailure { error ->
+                    if (isDestroyed) return@post
+                    folderSwitchPending = false
+                    val current = workspacePicker
+                    val message = error.message ?: "作業フォルダーを変更できませんでした。"
+                    if (current != null && request == pickerRequest) {
+                        workspacePicker = current.copy(error = message)
+                    } else {
+                        browserNotice = message
+                    }
                 }
             }
-            .onFailure { error ->
-                val current = workspacePicker
-                if (current != null) {
-                    workspacePicker = current.copy(
-                        error = error.message ?: "作業フォルダーを変更できませんでした。",
-                    )
-                } else {
-                    browserNotice = error.message ?: "作業フォルダーを変更できませんでした。"
-                }
-            }
+        }
     }
 
     private fun captureWorkspaceFolder(uri: Uri) {
-        if (!isTrustedWorkbenchUri(uri)) return
-        WorkspaceSession.captureFolderFromUrl(this, uri.toString())?.let { selected ->
-            workspaceFolder = selected.guestPath
+        if (folderSwitchPending || !isTrustedWorkbenchUri(uri)) return
+        val url = uri.toString()
+        // Most navigations repeat the open folder: skip them without any I/O.
+        val candidate = WorkspaceSession.folderFromWorkbenchUrl(url) ?: return
+        if (candidate == workspaceFolder) return
+        val appContext = applicationContext
+        runInBackground {
+            val selected = WorkspaceSession.captureFolderFromUrl(appContext, url)
+                ?: return@runInBackground
+            mainHandler.post {
+                if (!isDestroyed && !folderSwitchPending) workspaceFolder = selected
+            }
         }
+    }
+
+    private fun dismissBrowserNotice() {
+        val syncNotice = syncFailureNotice
+        if (syncNotice != null && browserNotice == syncNotice.first) {
+            dismissedSyncFailure = syncNotice.second
+        }
+        browserNotice = null
     }
 
     private fun handleSyncFolder() {
@@ -433,12 +515,31 @@ class WorkbenchActivity : ComponentActivity() {
 
     private fun loadWorkbench(url: String) {
         val view = webView ?: return
-        if (loadedUrl != url || view.url.isNullOrBlank() || view.url == "about:blank") {
-            loadedUrl = url
-            view.loadUrl(url)
-        } else {
-            view.reload()
+        val currentUrl = view.url?.takeUnless { it.isBlank() } ?: pendingLoadUrl
+        when (
+            WorkbenchSessionPolicy.loadAction(
+                targetUrl = url,
+                loadedUrl = loadedUrl,
+                currentUrl = currentUrl,
+                hasError = webError != null,
+            )
+        ) {
+            WorkbenchSessionPolicy.LoadAction.LOAD -> {
+                webError = null
+                startLoading(view, url)
+            }
+            WorkbenchSessionPolicy.LoadAction.RELOAD -> {
+                webError = null
+                view.reload()
+            }
+            WorkbenchSessionPolicy.LoadAction.NONE -> Unit
         }
+    }
+
+    private fun startLoading(view: WebView, url: String) {
+        loadedUrl = url
+        pendingLoadUrl = url
+        view.loadUrl(url)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -468,6 +569,11 @@ class WorkbenchActivity : ComponentActivity() {
             userAgentString = "$userAgentString Omochi/${BuildConfig.VERSION_NAME}"
             safeBrowsingEnabled = true
         }
+        // Keep the renderer important even while hidden. Waiving it when not visible
+        // would let Android reclaim the renderer during the external-browser sign-in,
+        // which is exactly when the workbench, its WebSockets and terminals must live.
+        // This is also WebView's default; it is stated here so it is not "optimised".
+        setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
 
         val currentWebView = this
         CookieManager.getInstance().apply {
@@ -483,6 +589,7 @@ class WorkbenchActivity : ComponentActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                pendingLoadUrl = null
                 webError = null
                 val uri = url.toUri()
                 captureWorkspaceFolder(uri)
@@ -504,6 +611,7 @@ class WorkbenchActivity : ComponentActivity() {
                 error: WebResourceError
             ) {
                 if (request.isForMainFrame) {
+                    pendingLoadUrl = null
                     webError = "画面を読み込めません: ${error.description}"
                 }
             }
@@ -512,8 +620,9 @@ class WorkbenchActivity : ComponentActivity() {
                 view: WebView,
                 detail: RenderProcessGoneDetail
             ): Boolean {
-                Log.w("OmochiWeb", "WebView renderer gone; crashed=${detail.didCrash()}")
+                Log.w(TAG, "WebView renderer gone; crashed=${detail.didCrash()}")
                 loadedUrl = null
+                pendingLoadUrl = null
                 if (webView === view) webView = null
                 (view.parent as? ViewGroup)?.removeView(view)
                 view.destroy()
@@ -543,7 +652,7 @@ class WorkbenchActivity : ComponentActivity() {
 
             override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
                 Log.d(
-                    "OmochiWeb",
+                    TAG,
                     "${consoleMessage.message()} (${consoleMessage.sourceId()}:${consoleMessage.lineNumber()})"
                 )
                 return true
@@ -614,8 +723,7 @@ class WorkbenchActivity : ComponentActivity() {
 
         val state = serverState
         if (state is OmochiServerManager.State.Running) {
-            loadedUrl = state.url
-            loadUrl(state.url)
+            startLoading(this, state.url)
         }
     }
 
@@ -694,7 +802,7 @@ class WorkbenchActivity : ComponentActivity() {
                 captureWorkspaceFolder(uri)
                 val target = uri.toString()
                 loadedUrl = target
-                webView?.takeIf { it !== popup }?.loadUrl(target)
+                webView?.takeIf { it !== popup }?.let { view -> startLoading(view, target) }
                 destroyPopup(popup)
                 true
             }
@@ -753,7 +861,12 @@ class WorkbenchActivity : ComponentActivity() {
         if (!isTrustedWorkbenchUri(uri) || !uri.path.orEmpty().trimEnd('/').endsWith("/login")) {
             return false
         }
-        val password = JSONObject.quote(OmochiRuntime.authPassword(applicationContext))
+        val secret = loginPassword
+            ?: runCatching { OmochiRuntime.authPassword(applicationContext) }.getOrElse {
+                webError = "ローカルIDEの認証情報を読み込めませんでした。"
+                return true
+            }.also { loginPassword = it }
+        val password = JSONObject.quote(secret)
         val script = """
             (() => {
               if (window.__omochiLoginSubmitted) return true;
@@ -777,400 +890,12 @@ class WorkbenchActivity : ComponentActivity() {
     }
 
     private fun injectTouchWorkbench(view: WebView) {
-        val script = """
-            (() => {
-              if (window.__omochiTouchInstalled) return;
-              window.__omochiTouchInstalled = true;
-              const viewport = document.querySelector('meta[name="viewport"]') || document.createElement('meta');
-              viewport.name = 'viewport';
-              viewport.content = 'width=device-width, initial-scale=1, maximum-scale=3, viewport-fit=cover';
-              if (!viewport.parentNode) document.head.appendChild(viewport);
-
-              const style = document.createElement('style');
-              style.id = 'omochi-touch-style';
-              style.textContent = `
-                html, body { overscroll-behavior: none; }
-                .monaco-workbench { font-family: -apple-system, BlinkMacSystemFont, Roboto, sans-serif !important; }
-                .monaco-workbench .part.activitybar .action-item,
-                .monaco-workbench .part.activitybar .action-label { min-height: 48px !important; min-width: 48px !important; }
-                .monaco-workbench .menubar-menu-button,
-                .monaco-workbench .menubar-menu-button .menubar-menu-title {
-                  min-width: 48px !important;
-                  min-height: 48px !important;
-                  line-height: 48px !important;
-                }
-                .monaco-workbench .part.sidebar .monaco-list-row,
-                .monaco-workbench .part.auxiliarybar .monaco-list-row,
-                .monaco-workbench .quick-input-list .monaco-list-row { min-height: 40px !important; }
-                .monaco-workbench .tabs-container .tab { min-height: 44px !important; }
-                .monaco-workbench .tabs-container .tab .tab-label { line-height: 44px !important; }
-                .monaco-workbench .monaco-action-bar .action-item > .action-label { min-width: 42px; min-height: 42px; }
-                .monaco-workbench .monaco-button { min-height: 44px !important; border-radius: 10px !important; }
-                .monaco-workbench input, .monaco-workbench textarea { font-size: max(16px, 1em); }
-                .monaco-workbench .xterm-helper-textarea { font-size: 16px !important; }
-                .monaco-workbench .monaco-scrollable-element > .scrollbar.vertical { width: 16px !important; }
-                .monaco-workbench .monaco-scrollable-element > .scrollbar.horizontal { height: 16px !important; }
-                .quick-input-widget { top: 6% !important; width: min(92vw, 720px) !important; margin-left: auto !important; margin-right: auto !important; border-radius: 14px !important; overflow: hidden; }
-                .context-view, .monaco-menu-container { max-width: calc(100vw - 12px) !important; }
-                .monaco-menu .monaco-action-bar.vertical .action-item,
-                .monaco-menu .monaco-action-bar.vertical .action-menu-item {
-                  min-height: 48px !important;
-                  line-height: 48px !important;
-                }
-                .monaco-menu .action-label { padding-top: 4px !important; padding-bottom: 4px !important; }
-                .menubar-menu-button.open .menubar-menu-items-holder > .monaco-scrollable-element > .scrollbar.vertical {
-                  opacity: 0 !important;
-                  pointer-events: none !important;
-                }
-                .monaco-workbench .part.statusbar { min-height: 32px !important; }
-                .monaco-workbench .breadcrumbs-below-tabs { min-height: 38px !important; }
-                .monaco-workbench .notifications-toasts .notification-toast { border-radius: 12px !important; }
-                [data-id="workbench.view.extensions"],
-                [data-command-id="workbench.view.extensions"] { display: none !important; }
-                @media (max-width: 600px) {
-                  .monaco-workbench .part.panel { min-height: 200px !important; }
-                  .monaco-workbench .codicon { font-size: 18px; }
-                  .monaco-dialog-box {
-                    box-sizing: border-box !important;
-                    width: calc(100vw - 16px) !important;
-                    min-width: 0 !important;
-                    max-width: calc(100vw - 16px) !important;
-                    height: min(76vh, 420px) !important;
-                    min-height: 300px !important;
-                    max-height: calc(100vh - 24px) !important;
-                    overflow: hidden !important;
-                  }
-                  .monaco-dialog-box .dialog-toolbar-row {
-                    box-sizing: border-box !important;
-                    width: 100% !important;
-                    max-width: 100% !important;
-                    flex: 0 0 48px !important;
-                  }
-                  .monaco-dialog-box .dialog-message-row {
-                    box-sizing: border-box !important;
-                    width: 100% !important;
-                    max-width: 100% !important;
-                    height: auto !important;
-                    min-height: 0 !important;
-                    flex: 1 1 auto !important;
-                    overflow: hidden !important;
-                  }
-                  .monaco-dialog-box .dialog-message-container {
-                    box-sizing: border-box !important;
-                    width: calc(100% - 24px) !important;
-                    min-width: 0 !important;
-                    max-width: calc(100% - 24px) !important;
-                    height: 100% !important;
-                    max-height: 100% !important;
-                    overflow: auto !important;
-                  }
-                  .monaco-dialog-box .dialog-message {
-                    height: auto !important;
-                    min-height: 44px !important;
-                    align-items: flex-start !important;
-                  }
-                  .monaco-dialog-box .dialog-buttons-row {
-                    box-sizing: border-box !important;
-                    width: 100% !important;
-                    max-width: 100% !important;
-                    height: auto !important;
-                    min-height: 60px !important;
-                    flex: 0 0 auto !important;
-                    overflow: visible !important;
-                  }
-                  .monaco-dialog-box .dialog-buttons {
-                    box-sizing: border-box !important;
-                    width: 100% !important;
-                    max-width: 100% !important;
-                    height: auto !important;
-                    flex-wrap: wrap !important;
-                    overflow: visible !important;
-                  }
-                  .monaco-dialog-box .dialog-buttons .monaco-button { max-width: 100% !important; }
-                }
-              `;
-              document.head.appendChild(style);
-
-              const nativeMenuRoutes = new Map([
-                ['workbench.action.files.openFolder', 'omochi://menu/open-folder'],
-                ['workbench.action.files.openFolderInNewWindow', 'omochi://menu/open-folder'],
-                ['workbench.action.files.openFolderViaWorkspace', 'omochi://menu/open-folder'],
-                ['workbench.action.files.openLocalFolder', 'omochi://menu/link-device-folder'],
-                ['workbench.action.closeFolder', 'omochi://menu/close-folder'],
-                ['workbench.action.quit', 'omochi://menu/exit-workbench'],
-                ['workbench.action.exit', 'omochi://menu/exit-workbench'],
-              ]);
-              const nativeMenuLabelRoutes = new Map([
-                ['フォルダーを開く', 'omochi://menu/open-folder'],
-                ['open folder', 'omochi://menu/open-folder'],
-                ['新しいウィンドウでフォルダーを開く', 'omochi://menu/open-folder'],
-                ['open folder in new window', 'omochi://menu/open-folder'],
-                ['ローカル フォルダーを開く', 'omochi://menu/link-device-folder'],
-                ['open local folder', 'omochi://menu/link-device-folder'],
-                ['フォルダーを閉じる', 'omochi://menu/close-folder'],
-                ['ワークスペースを閉じる', 'omochi://menu/close-folder'],
-                ['close folder', 'omochi://menu/close-folder'],
-                ['close workspace', 'omochi://menu/close-folder'],
-                ['終了', 'omochi://menu/exit-workbench'],
-                ['quit', 'omochi://menu/exit-workbench'],
-                ['exit', 'omochi://menu/exit-workbench'],
-                ['ウィンドウを閉じる', 'omochi://menu/exit-workbench'],
-                ['close window', 'omochi://menu/exit-workbench'],
-              ]);
-              const normalizedMenuLabel = (value) => (value || '')
-                .split('\n', 1)[0]
-                .trim()
-                .replace(/[.\u2026]+$/u, '')
-                .trim()
-                .toLocaleLowerCase();
-              const unsupportedMenuLabels = new Set([
-                '拡張機能',
-                'extensions',
-                'その他のデバッガーをインストールします',
-                'install additional debuggers',
-                'sign out of code-server',
-              ]);
-              const dismissWorkbenchOverlay = () => {
-                const target = document.activeElement || document.body;
-                const options = {
-                  key: 'Escape',
-                  code: 'Escape',
-                  keyCode: 27,
-                  which: 27,
-                  bubbles: true,
-                  cancelable: true,
-                  composed: true,
-                };
-                target.dispatchEvent(new KeyboardEvent('keydown', options));
-                target.dispatchEvent(new KeyboardEvent('keyup', options));
-                document.querySelector('.menubar-menu-button.open')?.click();
-              };
-              const menuActionForEvent = (event) => {
-                const action = event.target instanceof Element
-                  ? event.target.closest('.action-menu-item')
-                  : null;
-                return !action || action.classList.contains('disabled') ? null : action;
-              };
-              const nativeMenuRouteForAction = (action) => {
-                if (!action) return null;
-                const commandTarget = action.closest('[data-command-id]')
-                  || action.querySelector('[data-command-id]');
-                return nativeMenuRoutes.get(commandTarget?.getAttribute('data-command-id'))
-                  || nativeMenuLabelRoutes.get(normalizedMenuLabel(action.innerText));
-              };
-              let armedMenuAction = null;
-              let ignoreMenuClickUntil = 0;
-              let dispatchingMenuClick = false;
-              const dispatchNativeMenu = (route) => {
-                dismissWorkbenchOverlay();
-                window.prompt(
-                  'omochi-native-menu-v1',
-                  route.substring('omochi://menu/'.length),
-                );
-              };
-              const dispatchWorkbenchMenu = (action) => {
-                if (action.getAttribute('aria-haspopup') === 'true' ||
-                    action.querySelector('.submenu-indicator')) {
-                  const rect = action.getBoundingClientRect();
-                  ['mouseover', 'mousemove'].forEach((type) => {
-                    action.dispatchEvent(new MouseEvent(type, {
-                      bubbles: true,
-                      cancelable: true,
-                      composed: true,
-                      view: window,
-                      clientX: rect.left + rect.width / 2,
-                      clientY: rect.top + rect.height / 2,
-                      movementX: type === 'mousemove' ? 1 : 0,
-                    }));
-                  });
-                  return;
-                }
-                dispatchingMenuClick = true;
-                try {
-                  action.click();
-                } finally {
-                  dispatchingMenuClick = false;
-                }
-              };
-              const dispatchMenuAction = (selected) => {
-                if (selected.route) dispatchNativeMenu(selected.route);
-                else if (selected.action?.isConnected) dispatchWorkbenchMenu(selected.action);
-              };
-              const stopMenuEvent = (event) => {
-                event.preventDefault();
-                event.stopImmediatePropagation();
-              };
-              const handleTouchMenuPointer = (event) => {
-                const liveAction = menuActionForEvent(event);
-                const selected = liveAction ? {
-                  action: liveAction,
-                  route: nativeMenuRouteForAction(liveAction),
-                } : armedMenuAction;
-                if (!selected) return;
-
-                if (event.type === 'click') {
-                  if (dispatchingMenuClick) return;
-                  if (performance.now() < ignoreMenuClickUntil) {
-                    stopMenuEvent(event);
-                    return;
-                  }
-                  if (!selected.route) return;
-                  stopMenuEvent(event);
-                  dispatchNativeMenu(selected.route);
-                  return;
-                }
-
-                if (event.type === 'pointerdown') {
-                  armedMenuAction = {
-                    action: selected.action,
-                    route: selected.route,
-                    pointerId: event.pointerId,
-                    x: event.clientX,
-                    y: event.clientY,
-                    moved: false,
-                  };
-                  // Native replacements must never reach Code - OSS. Regular menu
-                  // rows keep their down/move stream so long menus remain scrollable.
-                  if (selected.route) stopMenuEvent(event);
-                  return;
-                }
-                if (event.type === 'pointermove' && armedMenuAction) {
-                  if (Math.abs(event.clientX - armedMenuAction.x) > 12 ||
-                      Math.abs(event.clientY - armedMenuAction.y) > 12) {
-                    armedMenuAction.moved = true;
-                  }
-                  if (armedMenuAction.route) stopMenuEvent(event);
-                  return;
-                }
-                if (event.type === 'pointercancel') {
-                  armedMenuAction = null;
-                  return;
-                }
-                if (event.type === 'pointerup') {
-                  const armed = armedMenuAction;
-                  armedMenuAction = null;
-                  if (!armed) return;
-                  ignoreMenuClickUntil = performance.now() + 600;
-                  if (armed.route || !armed.moved) stopMenuEvent(event);
-                  if (!armed.moved) {
-                    dispatchMenuAction(armed);
-                  }
-                  return;
-                }
-                if (event.type === 'mousedown' || event.type === 'mouseup' ||
-                    event.type === 'touchstart' || event.type === 'touchend') {
-                  if (selected.route || performance.now() < ignoreMenuClickUntil) {
-                    stopMenuEvent(event);
-                  }
-                  return;
-                }
-              };
-              [
-                'pointerdown',
-                'pointermove',
-                'pointerup',
-                'pointercancel',
-                'mousedown',
-                'mouseup',
-                'touchstart',
-                'touchend',
-                'click',
-              ].forEach((type) => window.addEventListener(
-                type,
-                handleTouchMenuPointer,
-                { capture: true, passive: false },
-              ));
-
-              const hideUnsupportedActions = () => {
-                let hidden = false;
-                document.querySelectorAll('[aria-label], [data-id], [data-command-id]').forEach((element) => {
-                  const label = (element.getAttribute('aria-label') || '').toLowerCase();
-                  const id = (element.getAttribute('data-id') || element.getAttribute('data-command-id') || '').toLowerCase();
-                  if (id.includes('workbench.view.extensions') || label === 'extensions' || label.startsWith('extensions ') || label.includes('拡張機能')) {
-                    const target = element.closest('.action-item') || element;
-                    target.style.setProperty('display', 'none', 'important');
-                    hidden = true;
-                  }
-                });
-                document.querySelectorAll('.monaco-menu .action-menu-item').forEach((element) => {
-                  if (!unsupportedMenuLabels.has(normalizedMenuLabel(element.innerText))) return;
-                  const target = element.closest('.action-item') || element;
-                  target.style.setProperty('display', 'none', 'important');
-                  target.setAttribute('aria-hidden', 'true');
-                  hidden = true;
-                });
-                return hidden;
-              };
-
-              let unsupportedActionsFrame = 0;
-              const scheduleUnsupportedActionsPass = () => {
-                if (unsupportedActionsFrame) return;
-                unsupportedActionsFrame = window.requestAnimationFrame(() => {
-                  unsupportedActionsFrame = 0;
-                  hideUnsupportedActions();
-                });
-              };
-              const unsupportedActionsObserver = new MutationObserver((mutations) => {
-                if (mutations.some((mutation) => [...mutation.addedNodes].some((node) =>
-                  node instanceof Element && (
-                    node.matches('.action-item, .action-menu-item, .monaco-menu, .monaco-menu-container') ||
-                    node.querySelector('.action-item, .action-menu-item, .monaco-menu, .monaco-menu-container')
-                  )
-                ))) scheduleUnsupportedActionsPass();
-              });
-              unsupportedActionsObserver.observe(document.body, { childList: true, subtree: true });
-              window.__omochiUnsupportedActionsObserver = unsupportedActionsObserver;
-
-              const prepareCompactLayout = () => {
-                if (window.innerWidth > 600 || window.__omochiCompactLayoutPrepared) return true;
-                const workbench = document.querySelector('.monaco-workbench');
-                const activeView = document.querySelector('.part.activitybar .action-item.checked');
-                if (!workbench || !activeView) return false;
-
-                const auxiliaryClose = document.querySelector(
-                  '.part.auxiliarybar .action-label.codicon-auxiliarybar-close'
-                );
-                if (auxiliaryClose) auxiliaryClose.click();
-
-                const sidebar = document.querySelector('.part.sidebar');
-                if (sidebar && sidebar.getBoundingClientRect().width > 0) activeView.click();
-                window.__omochiCompactLayoutPrepared = true;
-                return true;
-              };
-
-              const pinMobileWorkbenchOrigin = () => {
-                if (window.innerWidth > 600) return true;
-                const activityBar = document.querySelector('.part.activitybar.left');
-                const splitView = activityBar?.parentElement?.parentElement;
-                if (!splitView?.classList.contains('split-view-container')) return false;
-                if (!splitView.__omochiOriginPinned) {
-                  splitView.__omochiOriginPinned = true;
-                  splitView.addEventListener('scroll', () => {
-                    if (window.innerWidth <= 600 && splitView.scrollLeft !== 0) {
-                      splitView.scrollLeft = 0;
-                    }
-                  }, { passive: true });
-                }
-                if (splitView.scrollLeft !== 0) splitView.scrollLeft = 0;
-                return true;
-              };
-              window.addEventListener('resize', pinMobileWorkbenchOrigin);
-
-              hideUnsupportedActions();
-              pinMobileWorkbenchOrigin();
-              prepareCompactLayout();
-              let passes = 0;
-              const extensionTimer = window.setInterval(() => {
-                const hidden = hideUnsupportedActions();
-                const compact = prepareCompactLayout();
-                const pinned = pinMobileWorkbenchOrigin();
-                passes += 1;
-                if ((hidden && compact && pinned) || passes >= 20) window.clearInterval(extensionTimer);
-              }, 250);
-            })();
-        """.trimIndent()
-        view.evaluateJavascript(script, null)
+        view.evaluateJavascript(touchLayerScript(), null)
     }
+
+    private fun touchLayerScript(): String =
+        cachedTouchLayerScript ?: assets.open(TOUCH_LAYER_ASSET).bufferedReader().use { it.readText() }
+            .also { cachedTouchLayerScript = it }
 
     private fun toggleFullscreen() {
         fullscreenEnabled = !fullscreenEnabled
@@ -1309,722 +1034,51 @@ class WorkbenchActivity : ComponentActivity() {
     }
 }
 
-private enum class TouchPanelPage { Keys, Edit }
+/** Pure decisions of the workbench surface, free of Android types for JVM tests. */
+internal object WorkbenchSessionPolicy {
+    enum class LoadAction { NONE, LOAD, RELOAD }
 
-private data class WorkspacePickerState(
-    val currentGuestPath: String,
-    val folders: List<WorkspaceSession.Folder>,
-    val error: String?,
-)
-
-@Composable
-private fun WorkbenchScreen(
-    serverState: OmochiServerManager.State,
-    webError: String?,
-    showTouchBar: Boolean,
-    ctrlLatched: Boolean,
-    altLatched: Boolean,
-    shiftLatched: Boolean,
-    touchPanelPage: TouchPanelPage,
-    fullscreenEnabled: Boolean,
-    syncState: WorkspaceSyncManager.State,
-    workspaceFolder: String,
-    workspacePicker: WorkspacePickerState?,
-    createWebView: () -> WebView,
-    onClose: () -> Unit,
-    onToggleTouchBar: () -> Unit,
-    onToggleFullscreen: () -> Unit,
-    onOpenWorkspacePicker: () -> Unit,
-    onBrowseWorkspaceFolder: (String) -> Unit,
-    onCreateWorkspaceFolder: (String) -> Unit,
-    onSelectWorkspaceFolder: (String) -> Unit,
-    onDismissWorkspacePicker: () -> Unit,
-    onSyncFolder: () -> Unit,
-    onExplorer: () -> Unit,
-    onSearch: () -> Unit,
-    onSourceControl: () -> Unit,
-    onTerminal: () -> Unit,
-    onCommandPalette: () -> Unit,
-    onRetry: () -> Unit,
-    onToggleCtrl: () -> Unit,
-    onToggleAlt: () -> Unit,
-    onToggleShift: () -> Unit,
-    onTouchPanelPage: (TouchPanelPage) -> Unit,
-    onKey: (Int) -> Unit,
-    onShortcut: (String) -> Unit,
-    onShowIme: () -> Unit,
-    browserNotice: String?,
-    onDismissBrowserNotice: () -> Unit,
-) {
-    val imeBottom = with(LocalDensity.current) { WindowInsets.ime.getBottom(this).toDp() }
-    val navigationBottom = with(LocalDensity.current) { WindowInsets.navigationBars.getBottom(this).toDp() }
-    val imeVisible = imeBottom > navigationBottom
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(OmochiColors.Window)
-            .windowInsetsPadding(WindowInsets.statusBars)
-            .imePadding(),
-    ) {
-        StudioTopBar(
-            state = serverState,
-            syncState = syncState,
-            workspaceFolder = workspaceFolder,
-            touchPanelVisible = showTouchBar,
-            fullscreenEnabled = fullscreenEnabled,
-            onClose = onClose,
-            onToggleTouchPanel = onToggleTouchBar,
-            onToggleFullscreen = onToggleFullscreen,
-            onOpenWorkspacePicker = onOpenWorkspacePicker,
-            onSyncFolder = onSyncFolder,
-        )
-
-        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-            AndroidView(
-                factory = { createWebView() },
-                modifier = Modifier.fillMaxSize(),
-            )
-
-            when (serverState) {
-                OmochiServerManager.State.Stopped -> LoadingPanel("IDEセッションを開始しています…")
-                is OmochiServerManager.State.Starting -> LoadingPanel(serverState.message)
-                is OmochiServerManager.State.Failed -> ErrorPanel(serverState.message, onRetry)
-                is OmochiServerManager.State.Running -> {
-                    if (webError != null) ErrorPanel(webError, onRetry)
-                }
-            }
-
-            browserNotice?.let {
-                BrowserSessionNotice(
-                    message = it,
-                    onDismiss = onDismissBrowserNotice,
-                    modifier = Modifier.align(Alignment.TopCenter),
-                )
-            }
-        }
-
-        if (showTouchBar && !imeVisible) {
-            TouchControlPanel(
-                page = touchPanelPage,
-                ctrlLatched = ctrlLatched,
-                altLatched = altLatched,
-                shiftLatched = shiftLatched,
-                onPageChange = onTouchPanelPage,
-                onToggleCtrl = onToggleCtrl,
-                onToggleAlt = onToggleAlt,
-                onToggleShift = onToggleShift,
-                onKey = onKey,
-                onShortcut = onShortcut,
-                onShowIme = onShowIme,
-            )
-        }
-
-        if (!imeVisible) {
-            WorkspaceDock(
-                onExplorer = onExplorer,
-                onSearch = onSearch,
-                onSourceControl = onSourceControl,
-                onRun = { onShortcut("runAndDebug") },
-                onTerminal = onTerminal,
-                onCommandPalette = onCommandPalette,
-                modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars),
-            )
-        }
+    /**
+     * How the WebView reacts to a published Running([targetUrl]).
+     *
+     * [loadedUrl] is what this screen loaded from the current server session (null when
+     * nothing was, or when a fresh load is forced), [currentUrl] what the WebView shows
+     * or is loading, and [hasError] whether an error panel covers it. The same session
+     * published again must not reload a live page: that would drop the workbench's
+     * WebSockets and with them every terminal. Only an error or an empty WebView is
+     * worth another attempt.
+     */
+    fun loadAction(
+        targetUrl: String,
+        loadedUrl: String?,
+        currentUrl: String?,
+        hasError: Boolean,
+    ): LoadAction {
+        if (loadedUrl == null) return LoadAction.LOAD
+        if (currentUrl.isNullOrBlank() || currentUrl == "about:blank") return LoadAction.LOAD
+        // Another origin is another server process; its page cannot be kept.
+        if (!sameOrigin(targetUrl, loadedUrl)) return LoadAction.LOAD
+        return if (hasError) LoadAction.RELOAD else LoadAction.NONE
     }
 
-    workspacePicker?.let { picker ->
-        WorkspacePickerDialog(
-            state = picker,
-            selectedGuestPath = workspaceFolder,
-            onBrowse = onBrowseWorkspaceFolder,
-            onCreateFolder = onCreateWorkspaceFolder,
-            onSelect = onSelectWorkspaceFolder,
-            onDismiss = onDismissWorkspacePicker,
-        )
-    }
-}
+    /**
+     * Whether a sync failure deserves the banner: it follows a non-failed state or has a
+     * new message, and it is not the failure the user already closed. [previousFailure]
+     * is the message of the state seen just before, or null when that was not Failed.
+     */
+    fun shouldAnnounceSyncFailure(
+        previousFailure: String?,
+        message: String,
+        dismissedFailure: String?,
+    ): Boolean = message != dismissedFailure && message != previousFailure
 
-@Composable
-private fun WorkspacePickerDialog(
-    state: WorkspacePickerState,
-    selectedGuestPath: String,
-    onBrowse: (String) -> Unit,
-    onCreateFolder: (String) -> Unit,
-    onSelect: (String) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    var newFolderName by remember(state.currentGuestPath) { mutableStateOf("") }
-    val parent = WorkspaceSession.parentGuestFolder(state.currentGuestPath)
-
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
-    ) {
-        Surface(
-            color = OmochiColors.Raised,
-            shape = RoundedCornerShape(24.dp),
-            shadowElevation = 14.dp,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp)
-                .widthIn(max = 680.dp)
-                .heightIn(max = 660.dp),
-        ) {
-            Column(modifier = Modifier.padding(18.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Outlined.FolderOpen,
-                        contentDescription = null,
-                        tint = OmochiColors.Accent,
-                        modifier = Modifier.size(28.dp),
-                    )
-                    Column(modifier = Modifier.weight(1f).padding(start = 11.dp)) {
-                        Text(
-                            "作業フォルダーを変更",
-                            style = MaterialTheme.typography.titleLarge,
-                            color = OmochiColors.Ink,
-                        )
-                        Text(
-                            state.currentGuestPath,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = OmochiColors.Muted,
-                        )
-                    }
-                    IconButton(onClick = onDismiss, modifier = Modifier.size(48.dp)) {
-                        Icon(Icons.Outlined.Close, contentDescription = "閉じる")
-                    }
-                }
-
-                Text(
-                    "Omochi内の /workspace と、連携した端末フォルダーのミラーから選択できます。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = OmochiColors.Muted,
-                    modifier = Modifier.padding(top = 10.dp, bottom = 12.dp),
-                )
-
-                HorizontalDivider(color = OmochiColors.Border)
-
-                if (parent != null) {
-                    WorkspaceFolderRow(
-                        title = "ひとつ上のフォルダー",
-                        detail = parent,
-                        selected = false,
-                        onClick = { onBrowse(parent) },
-                    )
-                }
-
-                LazyColumn(
-                    modifier = Modifier.fillMaxWidth().heightIn(max = 270.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    items(state.folders, key = { it.guestPath }) { folder ->
-                        WorkspaceFolderRow(
-                            title = folder.displayName,
-                            detail = if (folder.guestPath == selectedGuestPath) {
-                                "現在開いています"
-                            } else if (folder.hasChildren) {
-                                "タップして中を見る"
-                            } else {
-                                folder.guestPath
-                            },
-                            selected = folder.guestPath == selectedGuestPath,
-                            onClick = { onBrowse(folder.guestPath) },
-                        )
-                    }
-                }
-
-                if (state.folders.isEmpty()) {
-                    Text(
-                        "このフォルダー内にサブフォルダーはありません。",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = OmochiColors.Muted,
-                        modifier = Modifier.padding(vertical = 12.dp),
-                    )
-                }
-
-                state.error?.let { error ->
-                    Text(
-                        error,
-                        color = OmochiColors.Red,
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.padding(vertical = 8.dp),
-                    )
-                }
-
-                OutlinedTextField(
-                    value = newFolderName,
-                    onValueChange = { newFolderName = it },
-                    label = { Text("新しいフォルダー名") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    TextButton(
-                        onClick = { onCreateFolder(newFolderName) },
-                        enabled = WorkspaceSession.isValidFolderName(newFolderName.trim()),
-                    ) {
-                        Icon(Icons.Outlined.CreateNewFolder, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("フォルダー作成")
-                    }
-                    Button(onClick = { onSelect(state.currentGuestPath) }) {
-                        Text("ここで開始")
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun WorkspaceFolderRow(
-    title: String,
-    detail: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    Surface(
-        onClick = onClick,
-        color = if (selected) OmochiColors.AccentSoft else Color.Transparent,
-        shape = RoundedCornerShape(13.dp),
-        modifier = Modifier.fillMaxWidth().heightIn(min = 58.dp),
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                Icons.Outlined.FolderOpen,
-                contentDescription = null,
-                tint = if (selected) OmochiColors.Accent else OmochiColors.Ink,
-                modifier = Modifier.size(24.dp),
-            )
-            Column(modifier = Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                Text(title, style = MaterialTheme.typography.bodyLarge, color = OmochiColors.Ink)
-                Text(
-                    detail,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = OmochiColors.Muted,
-                    maxLines = 1,
-                )
-            }
-            Icon(
-                Icons.Outlined.ChevronRight,
-                contentDescription = "開く",
-                tint = OmochiColors.Muted,
-                modifier = Modifier.size(22.dp),
-            )
-        }
-    }
-}
-
-@Composable
-private fun StudioTopBar(
-    state: OmochiServerManager.State,
-    syncState: WorkspaceSyncManager.State,
-    workspaceFolder: String,
-    touchPanelVisible: Boolean,
-    fullscreenEnabled: Boolean,
-    onClose: () -> Unit,
-    onToggleTouchPanel: () -> Unit,
-    onToggleFullscreen: () -> Unit,
-    onOpenWorkspacePicker: () -> Unit,
-    onSyncFolder: () -> Unit,
-) {
-    val stateText = when (state) {
-        OmochiServerManager.State.Stopped -> "待機中"
-        is OmochiServerManager.State.Starting -> "起動中"
-        is OmochiServerManager.State.Running -> "ローカル接続中"
-        is OmochiServerManager.State.Failed -> "再接続が必要"
-    }
-    val stateColor = when (state) {
-        is OmochiServerManager.State.Running -> OmochiColors.Green
-        is OmochiServerManager.State.Failed -> OmochiColors.Red
-        else -> OmochiColors.Yellow
-    }
-    val syncText = when (syncState) {
-        WorkspaceSyncManager.State.Disconnected -> "端末未連携"
-        is WorkspaceSyncManager.State.Ready -> "端末同期"
-        is WorkspaceSyncManager.State.Syncing -> "同期中"
-        is WorkspaceSyncManager.State.Failed -> "同期要確認"
-    }
-    val syncLinked = when (syncState) {
-        WorkspaceSyncManager.State.Disconnected -> false
-        is WorkspaceSyncManager.State.Ready -> true
-        is WorkspaceSyncManager.State.Syncing -> syncState.link != null
-        is WorkspaceSyncManager.State.Failed -> syncState.link != null
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(58.dp)
-            .background(Brush.verticalGradient(listOf(Color(0xFFFBFAF8), Color(0xFFE9E4DF))))
-            .border(0.5.dp, OmochiColors.Border)
-            .padding(horizontal = 5.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        TopAction(Icons.AutoMirrored.Outlined.ArrowBack, "ホームへ戻る", onClose)
-        MacTrafficLights()
-        Column(modifier = Modifier.weight(1f).padding(horizontal = 9.dp)) {
-            Text(
-                "Omochi",
-                style = MaterialTheme.typography.labelLarge,
-                color = OmochiColors.Ink,
-                maxLines = 1,
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(7.dp).clip(CircleShape).background(stateColor))
-                Spacer(Modifier.width(5.dp))
-                Text(
-                    "$stateText・$syncText",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = OmochiColors.Muted,
-                    maxLines = 1,
-                )
-            }
-        }
-        TopAction(
-            icon = Icons.Outlined.FolderOpen,
-            label = "作業フォルダーを変更: $workspaceFolder",
-            onClick = onOpenWorkspacePicker,
-            active = workspaceFolder != WorkspaceSession.GUEST_ROOT,
-        )
-        TopAction(
-            icon = Icons.Outlined.Sync,
-            label = if (syncLinked) "端末フォルダを今すぐ同期" else "端末フォルダを連携",
-            onClick = onSyncFolder,
-            active = syncLinked,
-        )
-        TopAction(
-            icon = if (touchPanelVisible) Icons.Outlined.KeyboardHide else Icons.Outlined.Keyboard,
-            label = if (touchPanelVisible) "タッチキーを隠す" else "タッチキーを表示",
-            onClick = onToggleTouchPanel,
-            active = touchPanelVisible,
-        )
-        TopAction(
-            icon = if (fullscreenEnabled) Icons.Outlined.FullscreenExit else Icons.Outlined.Fullscreen,
-            label = if (fullscreenEnabled) "フルスクリーンを終了" else "フルスクリーン",
-            onClick = onToggleFullscreen,
-        )
-    }
-}
-
-@Composable
-private fun MacTrafficLights() {
-    Row(
-        modifier = Modifier.padding(start = 1.dp, end = 3.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        listOf(OmochiColors.Red, OmochiColors.Yellow, OmochiColors.Green).forEach { color ->
-            Box(
-                Modifier
-                    .size(10.dp)
-                    .clip(CircleShape)
-                    .background(color)
-                    .border(0.5.dp, Color.Black.copy(alpha = 0.13f), CircleShape)
-            )
-        }
-    }
-}
-
-@Composable
-private fun TopAction(
-    icon: ImageVector,
-    label: String,
-    onClick: () -> Unit,
-    active: Boolean = false,
-) {
-    Surface(
-        onClick = onClick,
-        color = if (active) OmochiColors.AccentSoft else Color.Transparent,
-        shape = RoundedCornerShape(12.dp),
-        modifier = Modifier.size(48.dp).semantics { contentDescription = label },
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Icon(icon, contentDescription = null, tint = OmochiColors.Ink, modifier = Modifier.size(23.dp))
-        }
-    }
-}
-
-@Composable
-private fun WorkspaceDock(
-    onExplorer: () -> Unit,
-    onSearch: () -> Unit,
-    onSourceControl: () -> Unit,
-    onRun: () -> Unit,
-    onTerminal: () -> Unit,
-    onCommandPalette: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Surface(
-        color = Color(0xFFFAF8F6),
-        tonalElevation = 5.dp,
-        shadowElevation = 7.dp,
-        modifier = modifier.fillMaxWidth(),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().height(70.dp).padding(horizontal = 3.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            DockButton(Icons.Outlined.FolderOpen, "ファイル", onExplorer, Modifier.weight(1f))
-            DockButton(Icons.Outlined.Search, "検索", onSearch, Modifier.weight(1f))
-            DockButton(Icons.Outlined.AccountTree, "Git", onSourceControl, Modifier.weight(1f))
-            DockButton(Icons.Outlined.PlayArrow, "実行", onRun, Modifier.weight(1f))
-            DockButton(Icons.Outlined.Terminal, "端末", onTerminal, Modifier.weight(1f))
-            DockButton(Icons.Outlined.MoreHoriz, "コマンド", onCommandPalette, Modifier.weight(1f))
-        }
-    }
-}
-
-@Composable
-private fun DockButton(
-    icon: ImageVector,
-    label: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Surface(
-        onClick = onClick,
-        color = Color.Transparent,
-        shape = RoundedCornerShape(13.dp),
-        modifier = modifier.fillMaxSize(),
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-        ) {
-            Icon(icon, contentDescription = null, tint = OmochiColors.Ink, modifier = Modifier.size(23.dp))
-            Text(
-                label,
-                style = MaterialTheme.typography.labelSmall,
-                color = OmochiColors.Ink,
-                maxLines = 1,
-            )
-        }
-    }
-}
-
-@Composable
-private fun TouchControlPanel(
-    page: TouchPanelPage,
-    ctrlLatched: Boolean,
-    altLatched: Boolean,
-    shiftLatched: Boolean,
-    onPageChange: (TouchPanelPage) -> Unit,
-    onToggleCtrl: () -> Unit,
-    onToggleAlt: () -> Unit,
-    onToggleShift: () -> Unit,
-    onKey: (Int) -> Unit,
-    onShortcut: (String) -> Unit,
-    onShowIme: () -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(OmochiColors.Terminal)
-            .border(0.5.dp, Color.White.copy(alpha = 0.1f)),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 7.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            PanelTab("キー", page == TouchPanelPage.Keys) { onPageChange(TouchPanelPage.Keys) }
-            PanelTab("編集", page == TouchPanelPage.Edit) { onPageChange(TouchPanelPage.Edit) }
-            Text(
-                if (page == TouchPanelPage.Keys) "修飾キーは次の1入力に適用" else "よく使う編集操作",
-                color = Color.White.copy(alpha = 0.55f),
-                style = MaterialTheme.typography.labelSmall,
-                modifier = Modifier.weight(1f).padding(start = 4.dp),
-                maxLines = 1,
-            )
-        }
-
-        androidx.compose.foundation.lazy.LazyRow(
-            modifier = Modifier.fillMaxWidth().height(60.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 7.dp, vertical = 5.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (page == TouchPanelPage.Keys) {
-                item { KeyButton("ESC") { onKey(KeyEvent.KEYCODE_ESCAPE) } }
-                item { KeyButton("CTRL", ctrlLatched, onToggleCtrl) }
-                item { KeyButton("ALT", altLatched, onToggleAlt) }
-                item { KeyButton("SHIFT", shiftLatched, onToggleShift) }
-                item { KeyButton("TAB") { onKey(KeyEvent.KEYCODE_TAB) } }
-                item { KeyButton("←") { onKey(KeyEvent.KEYCODE_DPAD_LEFT) } }
-                item { KeyButton("↑") { onKey(KeyEvent.KEYCODE_DPAD_UP) } }
-                item { KeyButton("↓") { onKey(KeyEvent.KEYCODE_DPAD_DOWN) } }
-                item { KeyButton("→") { onKey(KeyEvent.KEYCODE_DPAD_RIGHT) } }
-                item { KeyButton("ENTER") { onKey(KeyEvent.KEYCODE_ENTER) } }
-                item { KeyButton("⌫") { onKey(KeyEvent.KEYCODE_DEL) } }
-                item { ImeButton(onShowIme) }
-            } else {
-                item { KeyButton("保存") { onShortcut("save") } }
-                item { KeyButton("元に戻す") { onShortcut("undo") } }
-                item { KeyButton("やり直す") { onShortcut("redo") } }
-                item { KeyButton("検索") { onShortcut("find") } }
-                item { KeyButton("置換") { onShortcut("replace") } }
-                item { KeyButton("ファイルを開く") { onShortcut("quickOpen") } }
-                item { KeyButton("エディタ分割") { onShortcut("splitEditor") } }
-                item { KeyButton("新しい端末") { onShortcut("newTerminal") } }
-                item { ImeButton(onShowIme) }
-            }
-        }
-    }
-}
-
-@Composable
-private fun PanelTab(label: String, selected: Boolean, onClick: () -> Unit) {
-    Surface(
-        onClick = onClick,
-        color = if (selected) OmochiColors.Accent else Color(0xFF36383E),
-        shape = RoundedCornerShape(10.dp),
-        modifier = Modifier.height(48.dp).width(84.dp),
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(label, color = Color.White, style = MaterialTheme.typography.labelLarge)
-        }
-    }
-}
-
-@Composable
-private fun KeyButton(label: String, active: Boolean = false, onClick: () -> Unit) {
-    Surface(
-        onClick = onClick,
-        color = if (active) OmochiColors.Accent else Color(0xFF36383E),
-        contentColor = Color.White,
-        shape = RoundedCornerShape(10.dp),
-        modifier = Modifier.height(50.dp).widthIn(min = 52.dp),
-    ) {
-        Box(Modifier.padding(horizontal = 14.dp), contentAlignment = Alignment.Center) {
-            Text(label, style = MaterialTheme.typography.labelLarge, color = Color.White, maxLines = 1)
-        }
-    }
-}
-
-@Composable
-private fun ImeButton(onClick: () -> Unit) {
-    Surface(
-        onClick = onClick,
-        color = OmochiColors.Accent,
-        shape = RoundedCornerShape(10.dp),
-        modifier = Modifier.height(50.dp),
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 15.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(Icons.Outlined.Keyboard, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(7.dp))
-            Text("日本語入力", color = Color.White, style = MaterialTheme.typography.labelLarge)
-        }
-    }
-}
-
-@Composable
-private fun BrowserSessionNotice(
-    message: String,
-    onDismiss: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Surface(
-        color = Color(0xF2232529),
-        contentColor = Color.White,
-        shape = RoundedCornerShape(14.dp),
-        shadowElevation = 8.dp,
-        modifier = modifier.padding(10.dp).fillMaxWidth(),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 15.dp)) {
-            Box(Modifier.size(9.dp).clip(CircleShape).background(OmochiColors.Green))
-            Text(
-                message,
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.weight(1f).padding(horizontal = 11.dp, vertical = 11.dp),
-            )
-            IconButton(onClick = onDismiss, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Outlined.Close, contentDescription = "閉じる", tint = Color.White)
-            }
-        }
-    }
-}
-
-@Composable
-private fun LoadingPanel(message: String) {
-    Box(
-        modifier = Modifier.fillMaxSize().background(OmochiColors.Window),
-        contentAlignment = Alignment.Center,
-    ) {
-        Surface(
-            color = OmochiColors.Raised,
-            shape = RoundedCornerShape(24.dp),
-            shadowElevation = 6.dp,
-            modifier = Modifier.padding(24.dp).fillMaxWidth(),
-        ) {
-            Column(
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 28.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                CircularProgressIndicator(color = OmochiColors.Accent)
-                Text(
-                    message,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = OmochiColors.Muted,
-                    modifier = Modifier.padding(top = 18.dp),
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                )
-                Text(
-                    "このセッションはブラウザを開いても継続します",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = OmochiColors.Muted,
-                    modifier = Modifier.padding(top = 7.dp),
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun ErrorPanel(message: String, onRetry: () -> Unit) {
-    Box(
-        modifier = Modifier.fillMaxSize().background(OmochiColors.Window.copy(alpha = 0.97f)),
-        contentAlignment = Alignment.Center,
-    ) {
-        Surface(
-            color = OmochiColors.Raised,
-            shape = RoundedCornerShape(24.dp),
-            shadowElevation = 8.dp,
-            modifier = Modifier.padding(22.dp).fillMaxWidth(),
-        ) {
-            Column(Modifier.padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(Icons.Outlined.Refresh, contentDescription = null, tint = OmochiColors.Accent, modifier = Modifier.size(30.dp))
-                Text(
-                    "ワークベンチへ再接続できません",
-                    style = MaterialTheme.typography.titleLarge,
-                    modifier = Modifier.padding(top = 11.dp),
-                )
-                Text(
-                    message,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = OmochiColors.Muted,
-                    modifier = Modifier.padding(vertical = 13.dp),
-                )
-                Button(
-                    onClick = onRetry,
-                    modifier = Modifier.fillMaxWidth().height(56.dp),
-                    shape = RoundedCornerShape(14.dp),
-                ) {
-                    Icon(Icons.Outlined.Refresh, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("IDEセッションを再起動")
-                }
-            }
-        }
+    private fun sameOrigin(first: String, second: String): Boolean {
+        val a = runCatching { URI(first) }.getOrNull() ?: return false
+        val b = runCatching { URI(second) }.getOrNull() ?: return false
+        val hostA = a.host ?: return false
+        val hostB = b.host ?: return false
+        return a.scheme.equals(b.scheme, ignoreCase = true) &&
+            hostA.equals(hostB, ignoreCase = true) &&
+            a.port == b.port
     }
 }

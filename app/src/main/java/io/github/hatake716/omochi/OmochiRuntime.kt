@@ -6,6 +6,8 @@ import android.os.Handler
 import android.os.Looper
 import android.system.Os
 import android.util.Base64
+import android.util.Log
+import androidx.core.content.edit
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
@@ -14,6 +16,7 @@ import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.math.BigDecimal
 import java.net.HttpURLConnection
 import java.net.URI
 import java.nio.file.Files
@@ -51,15 +54,80 @@ object OmochiRuntime {
     private const val CLAUDE_CODE_APT_SOURCE =
         "deb [signed-by=/etc/apt/keyrings/claude-code.asc] " +
             "https://downloads.claude.ai/claude-code/apt/stable stable main"
+    private const val TAG = "OmochiRuntime"
+    private const val RUNTIME_PREFERENCES = "omochi-runtime"
+    private const val PREF_PROOT_SECCOMP = "proot-seccomp-v1"
+    private const val PREF_PROOT_SECCOMP_FALLBACK_REASON = "proot-seccomp-fallback-reason-v1"
+    private const val PREF_PROOT_SECCOMP_FALLBACK_AT = "proot-seccomp-fallback-at-v1"
+    private const val SECCOMP_FALLBACK_REASON_LIMIT = 600
+    private const val SELF_TEST_LOG = "proot-self-test.log"
+
+    /** Upper bound for diagnostic output embedded in an exception shown by the UI. */
+    internal const val UI_DIAGNOSTIC_LIMIT = 8 * 1024
+    private const val SETTINGS_MIGRATION_MARKER = ".omochi-settings-migration"
     private val authLock = Any()
+    private val settingsLock = Any()
 
     data class LaunchSpec(
         val executable: String,
         val cwd: String,
         val args: Array<String>,
         val env: Array<String>,
-        val title: String
+        val title: String,
+        /** Whether this launch lets PRoot use its seccomp-bpf fast path. */
+        val prootSeccomp: Boolean = false
     )
+
+    /**
+     * Whether PRoot may use seccomp-bpf to skip ptrace stops for syscalls it does not
+     * rewrite. Without it every syscall of code-server, the extension host, ptyHost,
+     * bash, git, rg and claude stops in the tracer, which makes the whole IDE slow.
+     *
+     * Enabled by default. It is off when the user turned it off, or after
+     * [disableProotSeccomp] recorded an automatic fallback on this device.
+     */
+    fun prootSeccompEnabled(context: Context): Boolean {
+        val preferences = runtimePreferences(context)
+        return preferences.getBoolean(PREF_PROOT_SECCOMP, true) &&
+            preferences.getString(PREF_PROOT_SECCOMP_FALLBACK_REASON, null) == null
+    }
+
+    /**
+     * Persistently falls back to PROOT_NO_SECCOMP=1 after a launch that used seccomp
+     * failed in a way that seccomp could explain. The reason and time are kept so the
+     * dashboard can explain why the fast path is off; [setProotSeccompPreference] with
+     * `true` clears the record.
+     */
+    fun disableProotSeccomp(context: Context, reason: String) {
+        val compact = reason.trim().ifBlank { "原因不明の起動失敗" }
+            .take(SECCOMP_FALLBACK_REASON_LIMIT)
+        runtimePreferences(context).edit(commit = true) {
+            putString(PREF_PROOT_SECCOMP_FALLBACK_REASON, compact)
+            putLong(PREF_PROOT_SECCOMP_FALLBACK_AT, System.currentTimeMillis())
+        }
+        Log.w(TAG, "PRoot seccomp fast path disabled: $compact")
+    }
+
+    /**
+     * Dashboard toggle. `true` also forgets an automatic fallback so the next session
+     * launch tries seccomp again; a running session keeps the mode it started with.
+     */
+    fun setProotSeccompPreference(context: Context, enabled: Boolean) {
+        runtimePreferences(context).edit(commit = true) {
+            putBoolean(PREF_PROOT_SECCOMP, enabled)
+            if (enabled) {
+                remove(PREF_PROOT_SECCOMP_FALLBACK_REASON)
+                remove(PREF_PROOT_SECCOMP_FALLBACK_AT)
+            }
+        }
+    }
+
+    /** Why seccomp was automatically disabled on this device (for display), or null. */
+    fun prootSeccompFallbackReason(context: Context): String? =
+        runtimePreferences(context).getString(PREF_PROOT_SECCOMP_FALLBACK_REASON, null)
+
+    private fun runtimePreferences(context: Context) =
+        context.getSharedPreferences(RUNTIME_PREFERENCES, Context.MODE_PRIVATE)
 
     data class InstallProgress(
         val phase: String,
@@ -514,10 +582,11 @@ object OmochiRuntime {
                 installJapaneseAndClaude(appContext, ::progress)
 
                 progress(InstallProgress("self-test", "Code - OSSエンジンを検証しています…", 99))
-                val testResult = runGuestCommandSync(
+                val testResult = runGuestCheckWithSeccompFallback(
                     context = appContext,
                     command = "${serverGuestBinary()} --version",
-                    timeoutSeconds = 60
+                    timeoutSeconds = 60,
+                    label = "code-serverセルフテスト"
                 )
                 check(testResult.exitCode == 0) {
                     "code-serverセルフテストに失敗しました (exit=${testResult.exitCode}): " +
@@ -547,6 +616,10 @@ object OmochiRuntime {
         val rootfs = rootfsDir(context, DEFAULT_CONTAINER)
         check(isInstalled(context)) { "Omochiの初回セットアップが完了していません。" }
         require(port in 1024..65535) { "無効なloopbackポートです: $port" }
+        // code-server が settings.json を読む前に、版更新で増えた既定値だけを反映する。
+        // ユーザー設定の保全が優先なので、失敗しても起動は止めない。
+        runCatching { ensureWorkbenchSettings(context, writeDefaultsIfMissing = false) }
+            .onFailure { Log.w(TAG, "Workbench settings migration skipped", it) }
         val password = authPassword(context)
         val workspaceFolder = WorkspaceSession.selectedGuestFolder(context)
 
@@ -583,14 +656,16 @@ object OmochiRuntime {
         )
 
         val proot = ensureHostRuntime(context).getOrThrow()
+        val seccomp = prootSeccompEnabled(context)
         LaunchSpec(
             executable = proot.absolutePath,
             cwd = runtimeDir(context).absolutePath,
             args = args.toTypedArray(),
-            env = hostEnvironment(context, rootfs, verbose = false)
+            env = hostEnvironment(context, rootfs, verbose = false, seccomp = seccomp)
                 .map { "${it.key}=${it.value}" }
                 .toTypedArray(),
-            title = "Omochi — $workspaceFolder"
+            title = "Omochi — $workspaceFolder",
+            prootSeccomp = seccomp
         )
     }
 
@@ -889,10 +964,11 @@ object OmochiRuntime {
         }
 
         progress(InstallProgress("claude-test", "Claude Codeを実行して確認しています…", 98))
-        val claudeTest = runGuestCommandSync(
+        val claudeTest = runGuestCheckWithSeccompFallback(
             context = context,
             command = "claude --version",
             timeoutSeconds = 120,
+            label = "Claude Codeセルフテスト",
         )
         check(claudeTest.exitCode == 0) {
             "Claude Codeセルフテストに失敗しました (exit=${claudeTest.exitCode}): " +
@@ -918,65 +994,9 @@ object OmochiRuntime {
     }
 
     private fun configureCodeServer(context: Context) {
-        val rootfs = rootfsDir(context, DEFAULT_CONTAINER)
-        val userDir = File(rootfs, "root/.local/share/omochi/User").apply { mkdirs() }
-        val colors = JSONObject()
-            .put("titleBar.activeBackground", "#E9E4DF")
-            .put("titleBar.activeForeground", "#24262B")
-            .put("activityBar.background", "#EEEAE6")
-            .put("activityBar.foreground", "#24262B")
-            .put("activityBar.inactiveForeground", "#777A82")
-            .put("sideBar.background", "#F4F1ED")
-            .put("sideBar.foreground", "#2F3035")
-            .put("sideBar.border", "#D5CFC9")
-            .put("editorGroupHeader.tabsBackground", "#ECE8E3")
-            .put("tab.activeBackground", "#FFFFFF")
-            .put("tab.inactiveBackground", "#ECE8E3")
-            .put("tab.border", "#D5CFC9")
-            .put("statusBar.background", "#C96954")
-            .put("statusBar.foreground", "#FFFFFF")
-            .put("focusBorder", "#C96954")
-            .put("button.background", "#C96954")
-            .put("button.hoverBackground", "#B85B48")
-            .put("list.activeSelectionBackground", "#D9CFCA")
-            .put("list.hoverBackground", "#E8E2DD")
-
-        val settings = JSONObject()
-            .put("workbench.startupEditor", "none")
-            .put("workbench.colorTheme", "Default Light Modern")
-            .put("workbench.iconTheme", "vs-seti")
-            .put("workbench.commandPalette.experimental.suggestCommands", true)
-            .put("workbench.editor.showTabs", "multiple")
-            .put("workbench.editor.tabSizing", "shrink")
-            .put("workbench.list.smoothScrolling", true)
-            .put("workbench.tree.indent", 16)
-            .put("workbench.colorCustomizations", colors)
-            .put("window.commandCenter", true)
-            .put("window.menuBarVisibility", "compact")
-            .put("editor.fontSize", 14)
-            .put("editor.lineHeight", 22)
-            .put("editor.fontLigatures", true)
-            .put("editor.cursorSmoothCaretAnimation", "on")
-            .put("editor.cursorBlinking", "smooth")
-            .put("editor.smoothScrolling", true)
-            .put("editor.stickyScroll.enabled", true)
-            .put("editor.minimap.enabled", true)
-            .put("editor.wordWrap", "on")
-            .put("editor.multiCursorModifier", "ctrlCmd")
-            .put("terminal.integrated.fontSize", 13)
-            .put("terminal.integrated.cursorBlinking", true)
-            .put("terminal.integrated.smoothScrolling", true)
-            .put("terminal.integrated.defaultProfile.linux", "bash")
-            .put("files.autoSave", "afterDelay")
-            .put("files.autoSaveDelay", 1_000)
-            .put("files.trimTrailingWhitespace", false)
-            .put("search.useIgnoreFiles", true)
-            .put("git.autofetch", false)
-            .put("git.confirmSync", true)
-            .put("extensions.autoCheckUpdates", false)
-            .put("extensions.autoUpdate", false)
-            .put("telemetry.telemetryLevel", "off")
-        File(userDir, "settings.json").writeText(settings.toString(2) + "\n")
+        // 再セットアップ(code-server の版更新を含む)でユーザー設定を消さない。
+        // 既存の settings.json には移行だけを適用する。
+        ensureWorkbenchSettings(context, writeDefaultsIfMissing = true)
 
         val product = File(serverHostDir(context), "lib/vscode/product.json")
         if (product.isFile) {
@@ -987,6 +1007,78 @@ object OmochiRuntime {
             json.put("applicationName", "omochi")
             product.writeText(json.toString(2) + "\n")
         }
+    }
+
+    /**
+     * Keeps User/settings.json in step with Omochi's defaults without taking it over.
+     *
+     * A missing or empty file receives [WorkbenchSettings.defaultSettingsText] when
+     * [writeDefaultsIfMissing]. An existing file only gets [WorkbenchSettings.migrate],
+     * once per [WorkbenchSettings.VERSION]: the marker next to the user data lets later
+     * launches skip the work and keeps a key the user deletes afterwards from coming
+     * back. A file the migration declines (comments, syntax errors) is not marked, so
+     * it is looked at again once the user fixes it.
+     */
+    internal fun ensureWorkbenchSettings(context: Context, writeDefaultsIfMissing: Boolean) {
+        val userData = File(rootfsDir(context, DEFAULT_CONTAINER), "root/.local/share/omochi")
+        val action = synchronized(settingsLock) {
+            syncWorkbenchSettings(
+                settingsFile = File(userData, "User/settings.json"),
+                marker = File(userData, SETTINGS_MIGRATION_MARKER),
+                writeDefaultsIfMissing = writeDefaultsIfMissing
+            )
+        }
+        if (action != null) Log.i(TAG, "Workbench settings: $action")
+    }
+
+    /**
+     * File side of [ensureWorkbenchSettings], free of Android APIs so JVM tests run it.
+     * Returns a short description of what it did, or null when nothing was needed.
+     */
+    internal fun syncWorkbenchSettings(
+        settingsFile: File,
+        marker: File,
+        writeDefaultsIfMissing: Boolean
+    ): String? {
+        // ゲスト内のドットファイルへのリンクはゲストの絶対パスを指すため、ホストからは
+        // 正しく辿れない。置き換えるとリンクを壊すので触らない。
+        if (Files.isSymbolicLink(settingsFile.toPath())) return "symbolic link left as is"
+        if (settingsFile.exists() && !settingsFile.isFile) return "not a regular file"
+        val markerText = "version=${WorkbenchSettings.VERSION}\n"
+        if (!settingsFile.exists() || settingsFile.length() == 0L) {
+            if (!writeDefaultsIfMissing) return null
+            writeAtomically(settingsFile, WorkbenchSettings.defaultSettingsText())
+            writeAtomically(marker, markerText)
+            return "defaults written"
+        }
+
+        val applied = markerValues(marker.readTextSafely())["version"]?.toIntOrNull() ?: 0
+        if (applied >= WorkbenchSettings.VERSION) return null
+        return when (val outcome = WorkbenchSettings.migrate(settingsFile.readText())) {
+            is WorkbenchSettings.Outcome.Updated -> {
+                writeAtomically(settingsFile, outcome.text)
+                writeAtomically(marker, markerText)
+                "migrated ${outcome.changedKeys}"
+            }
+            WorkbenchSettings.Outcome.Unchanged -> {
+                writeAtomically(marker, markerText)
+                "already current"
+            }
+            is WorkbenchSettings.Outcome.Skipped -> "left as is: ${outcome.reason}"
+        }
+    }
+
+    private fun writeAtomically(target: File, text: String) {
+        val parent = target.absoluteFile.parentFile ?: error("親フォルダーがありません: $target")
+        parent.mkdirs()
+        val temporary = File(parent, "${target.name}.part")
+        temporary.writeText(text)
+        Files.move(
+            temporary.toPath(),
+            target.toPath(),
+            StandardCopyOption.REPLACE_EXISTING,
+            StandardCopyOption.ATOMIC_MOVE
+        )
     }
 
     private fun createWelcomeFile(context: Context) {
@@ -1051,7 +1143,8 @@ object OmochiRuntime {
         context: Context,
         command: String,
         timeoutSeconds: Long,
-        onLine: (String) -> Unit = {}
+        onLine: (String) -> Unit = {},
+        seccomp: Boolean = prootSeccompEnabled(context)
     ): GuestCommandResult {
         val rootfs = rootfsDir(context, DEFAULT_CONTAINER)
         val fullCommand = baseProotArgs(context, rootfs) + listOf(
@@ -1070,7 +1163,7 @@ object OmochiRuntime {
             .redirectErrorStream(true)
         builder.environment().apply {
             clear()
-            putAll(hostEnvironment(context, rootfs, verbose = false))
+            putAll(hostEnvironment(context, rootfs, verbose = false, seccomp = seccomp))
         }
         val process = builder.start()
         val output = StringBuilder()
@@ -1124,14 +1217,22 @@ object OmochiRuntime {
             command = listOf(proot.absolutePath, "--version"),
             rootfs = null,
             timeoutSeconds = 10,
-            verbose = false
+            verbose = false,
+            seccomp = prootSeccompEnabled(context)
         )
         check(result.exitCode == 0) {
-            "Android版PRoot本体を実行できません (exit=${result.exitCode}): ${result.output.ifBlank { "no output" }}"
+            "Android版PRoot本体を実行できません (exit=${result.exitCode}): " +
+                diagnosticExcerpt(result.output.ifBlank { "no output" })
         }
         result.output.lineSequence().firstOrNull().orEmpty().ifBlank { "proot executable OK" }
     }
 
+    /**
+     * Boots /bin/sh through PRoot with PROOT_VERBOSE. When the seccomp fast path is on
+     * and the probe fails, it is retried once with PROOT_NO_SECCOMP=1; if only that
+     * succeeds, this device is switched to the ptrace-only mode for good (see
+     * [disableProotSeccomp]) and setup continues.
+     */
     fun selfTestContainer(context: Context, name: String): Result<String> = runCatching {
         ensureHostRuntime(context).getOrThrow()
         val rootfs = rootfsDir(context, name)
@@ -1139,6 +1240,30 @@ object OmochiRuntime {
             "Linux rootfsに /bin/sh がありません。展開に失敗しています。"
         }
 
+        val log = selfTestLogFile(context)
+        runCatching { log.parentFile?.mkdirs(); log.writeText("") }
+        val seccomp = prootSeccompEnabled(context)
+        val first = containerProbe(context, rootfs, seccomp, log)
+        val firstError = first.exceptionOrNull()
+        if (firstError != null) {
+            if (!seccomp) throw firstError
+            // seccomp を切っても失敗するなら seccomp は原因ではない。方針は変えずにその失敗を報告する。
+            containerProbe(context, rootfs, seccomp = false, log = log).getOrThrow()
+            disableProotSeccomp(
+                context,
+                "Linux起動テストがseccomp有効時だけ失敗しました: " +
+                    firstError.message.orEmpty().lineSequence().firstOrNull().orEmpty().take(200)
+            )
+        }
+        "embedded-runtime-ok"
+    }
+
+    private fun containerProbe(
+        context: Context,
+        rootfs: File,
+        seccomp: Boolean,
+        log: File
+    ): Result<Unit> = runCatching {
         val result = runHostProcess(
             context = context,
             command = baseProotArgs(context, rootfs) + listOf(
@@ -1146,15 +1271,78 @@ object OmochiRuntime {
             ),
             rootfs = rootfs,
             timeoutSeconds = 25,
-            verbose = true
+            verbose = true,
+            seccomp = seccomp
         )
+        // PROOT_VERBOSE=9 の出力は数百KBになる。全文はファイルへ残し、UI には抜粋だけ渡す。
+        runCatching {
+            log.appendText(
+                "== seccomp=${if (seccomp) "on" else "off"} exit=${result.exitCode} ==\n" +
+                    result.output + "\n"
+            )
+        }
+        val output = result.output.ifBlank { "no output" }
         check(result.exitCode == 0) {
-            "PRootセルフテスト失敗 (exit=${result.exitCode}): ${result.output.ifBlank { "no output" }}"
+            "PRootセルフテスト失敗 (exit=${result.exitCode}, seccomp=${if (seccomp) "on" else "off"}): " +
+                diagnosticExcerpt(output, log)
         }
         check(result.output.contains("embedded-runtime-ok")) {
-            "Linuxセルフテストの応答が不正です: ${result.output.ifBlank { "no output" }}"
+            "Linuxセルフテストの応答が不正です: " + diagnosticExcerpt(output, log)
         }
-        "embedded-runtime-ok"
+    }
+
+    private fun selfTestLogFile(context: Context) =
+        File(File(context.filesDir, "logs"), SELF_TEST_LOG)
+
+    private fun diagnosticExcerpt(output: String, log: File? = null): String =
+        boundedDiagnostic(output, UI_DIAGNOSTIC_LIMIT, log?.absolutePath)
+
+    /**
+     * Shrinks tool output for an exception message that ends up in the UI. The tail
+     * carries the actual error, so it keeps a short head (PRoot's configuration dump)
+     * and the rest from the end, naming the file that holds the full log.
+     */
+    internal fun boundedDiagnostic(output: String, limit: Int, fullLogPath: String?): String {
+        if (output.length <= limit) return output
+        val headLength = (limit / 8).coerceAtMost(1_024)
+        val tailLength = (limit - headLength).coerceAtLeast(0)
+        var headEnd = headLength
+        if (headEnd in 1 until output.length && output[headEnd - 1].isHighSurrogate()) headEnd--
+        var tailStart = output.length - tailLength
+        if (tailStart in 1 until output.length && output[tailStart].isLowSurrogate()) tailStart++
+        val omitted = tailStart - headEnd
+        val where = fullLogPath?.let { "。完全なログ: $it" }.orEmpty()
+        return output.substring(0, headEnd) +
+            "\n… ($omitted 文字省略$where) …\n" +
+            output.substring(tailStart)
+    }
+
+    /**
+     * Runs a short guest check (for example `code-server --version`). With seccomp on,
+     * a failure is retried once with PROOT_NO_SECCOMP=1, and a pass there records the
+     * automatic fallback. Returns the result that decides the check.
+     */
+    private fun runGuestCheckWithSeccompFallback(
+        context: Context,
+        command: String,
+        timeoutSeconds: Long,
+        label: String
+    ): GuestCommandResult {
+        val seccomp = prootSeccompEnabled(context)
+        val first = runCatching {
+            runGuestCommandSync(context, command, timeoutSeconds, seccomp = seccomp)
+        }
+        if (!seccomp || first.getOrNull()?.exitCode == 0) return first.getOrThrow()
+
+        val retry = runGuestCommandSync(context, command, timeoutSeconds, seccomp = false)
+        if (retry.exitCode == 0) {
+            val cause = first.fold(
+                onSuccess = { "exit=${it.exitCode}" },
+                onFailure = { it.message.orEmpty().take(200) }
+            )
+            disableProotSeccomp(context, "${label}がseccomp有効時だけ失敗しました ($cause)")
+        }
+        return retry
     }
 
     fun buildLaunchSpec(
@@ -1189,17 +1377,19 @@ object OmochiRuntime {
             "/bin/bash", "-lc", guestCommand
         )
 
+        val seccomp = prootSeccompEnabled(context)
         LaunchSpec(
             executable = proot.absolutePath,
             cwd = runtimeDir(context).absolutePath,
             args = args.toTypedArray(),
-            env = hostEnvironment(context, rootfs, verbose = false)
+            env = hostEnvironment(context, rootfs, verbose = false, seccomp = seccomp)
                 .map { "${it.key}=${it.value}" }
                 .toTypedArray(),
             title = when (mode) {
                 LaunchMode.SHELL -> "$container — Linux"
                 LaunchMode.COMMAND -> "$container — Task"
-            }
+            },
+            prootSeccomp = seccomp
         )
     }
 
@@ -1365,14 +1555,15 @@ object OmochiRuntime {
         command: List<String>,
         rootfs: File?,
         timeoutSeconds: Long,
-        verbose: Boolean
+        verbose: Boolean,
+        seccomp: Boolean
     ): ProcessResult {
         val builder = ProcessBuilder(command)
             .directory(runtimeDir(context))
             .redirectErrorStream(true)
         builder.environment().apply {
             clear()
-            putAll(hostEnvironment(context, rootfs, verbose))
+            putAll(hostEnvironment(context, rootfs, verbose, seccomp))
         }
         val process = builder.start()
         val captured = StringBuilder()
@@ -1402,25 +1593,47 @@ object OmochiRuntime {
     private fun hostEnvironment(
         context: Context,
         rootfs: File?,
+        verbose: Boolean,
+        seccomp: Boolean
+    ): MutableMap<String, String> = prootHostEnvironment(
+        home = context.filesDir.canonical(),
+        tempDir = tempDir(context).canonical(),
+        loader = prootLoader(context).canonical(),
+        libraryPath = nativeDir(context).canonical(),
+        // canonicalPath 必須: PRoot は --rootfs を realpath で正規化する一方、
+        // PROOT_L2S_DIR は文字列をそのまま使うため、綴りを揃えないと
+        // link2symlink の疑似ハードリンクが解決不能になる(canonical() の説明参照)。
+        l2sDir = rootfs?.let { File(it, ".l2s").apply { mkdirs() }.canonical() },
+        seccomp = seccomp,
+        verbose = verbose
+    )
+
+    /**
+     * The host-side environment PRoot itself runs with. Pure so JVM tests can pin
+     * which variables each mode sets. PROOT_NO_SECCOMP is present only when the
+     * seccomp-bpf fast path is off: PRoot checks the variable for existence, so any
+     * value (even "0") would disable seccomp.
+     */
+    internal fun prootHostEnvironment(
+        home: String,
+        tempDir: String,
+        loader: String,
+        libraryPath: String,
+        l2sDir: String?,
+        seccomp: Boolean,
         verbose: Boolean
     ): MutableMap<String, String> = linkedMapOf<String, String>().apply {
-        put("HOME", context.filesDir.canonical())
-        put("TMPDIR", tempDir(context).canonical())
-        put("PROOT_TMP_DIR", tempDir(context).canonical())
-        put("PROOT_LOADER", prootLoader(context).canonical())
-        put("PROOT_NO_SECCOMP", "1")
-        put("LD_LIBRARY_PATH", nativeDir(context).canonical())
+        put("HOME", home)
+        put("TMPDIR", tempDir)
+        put("PROOT_TMP_DIR", tempDir)
+        put("PROOT_LOADER", loader)
+        if (!seccomp) put("PROOT_NO_SECCOMP", "1")
+        put("LD_LIBRARY_PATH", libraryPath)
         put("PATH", "/system/bin:/system/xbin")
         put("ANDROID_DATA", "/data")
         put("ANDROID_ROOT", "/system")
         put("TERM", "xterm-256color")
-        if (rootfs != null) {
-            val l2s = File(rootfs, ".l2s").apply { mkdirs() }
-            // canonicalPath 必須: PRoot は --rootfs を realpath で正規化する一方、
-            // PROOT_L2S_DIR は文字列をそのまま使うため、綴りを揃えないと
-            // link2symlink の疑似ハードリンクが解決不能になる(canonical() の説明参照)。
-            put("PROOT_L2S_DIR", l2s.canonical())
-        }
+        if (l2sDir != null) put("PROOT_L2S_DIR", l2sDir)
         if (verbose) put("PROOT_VERBOSE", "9")
     }
 
@@ -1435,4 +1648,520 @@ object OmochiRuntime {
 
     private fun File.readTextSafely(): String =
         runCatching { if (isFile) readText() else "" }.getOrDefault("")
+}
+
+/**
+ * Omochi's defaults for the Code - OSS user settings and their versioned migration.
+ *
+ * settings.json belongs to the user once it exists. [migrate] only adds keys the file
+ * does not have and replaces values that still exactly equal an older Omochi default.
+ * It edits the original text in place, so the user's formatting, key order and other
+ * values survive byte for byte. Files with comments (JSONC) are left alone rather than
+ * risk losing the comments.
+ *
+ * Pure Kotlin with its own small JSON reader so JVM tests exercise exactly the code
+ * that runs on the device (Android's org.json is only a stub there).
+ */
+internal object WorkbenchSettings {
+    /** Bump together with a new rule in [replacements] or [additions]. */
+    const val VERSION = 2
+
+    const val LIGHT_THEME = "Default Light Modern"
+
+    private const val MAX_DEPTH = 64
+
+    /** The warm palette Omochi 0.x applied to every theme (the old global default). */
+    val legacyWarmPalette: Map<String, Any?> = linkedMapOf(
+        "titleBar.activeBackground" to "#E9E4DF",
+        "titleBar.activeForeground" to "#24262B",
+        "activityBar.background" to "#EEEAE6",
+        "activityBar.foreground" to "#24262B",
+        "activityBar.inactiveForeground" to "#777A82",
+        "sideBar.background" to "#F4F1ED",
+        "sideBar.foreground" to "#2F3035",
+        "sideBar.border" to "#D5CFC9",
+        "editorGroupHeader.tabsBackground" to "#ECE8E3",
+        "tab.activeBackground" to "#FFFFFF",
+        "tab.inactiveBackground" to "#ECE8E3",
+        "tab.border" to "#D5CFC9",
+        "statusBar.background" to "#C96954",
+        "statusBar.foreground" to "#FFFFFF",
+        "focusBorder" to "#C96954",
+        "button.background" to "#C96954",
+        "button.hoverBackground" to "#B85B48",
+        "list.activeSelectionBackground" to "#D9CFCA",
+        "list.hoverBackground" to "#E8E2DD",
+    )
+
+    /** iOS system colours for [LIGHT_THEME]. */
+    val iosLightPalette: Map<String, Any?> = linkedMapOf(
+        "titleBar.activeBackground" to "#F2F2F7",
+        "titleBar.activeForeground" to "#000000",
+        "titleBar.inactiveBackground" to "#F2F2F7",
+        "activityBar.background" to "#F2F2F7",
+        "activityBar.foreground" to "#007AFF",
+        "activityBar.inactiveForeground" to "#8E8E93",
+        "activityBar.activeBorder" to "#007AFF",
+        "activityBarBadge.background" to "#FF3B30",
+        "activityBarBadge.foreground" to "#FFFFFF",
+        "sideBar.background" to "#F2F2F7",
+        "sideBar.foreground" to "#1C1C1E",
+        "sideBar.border" to "#D1D1D6",
+        "sideBarSectionHeader.background" to "#F2F2F7",
+        "editorGroupHeader.tabsBackground" to "#F2F2F7",
+        "tab.activeBackground" to "#FFFFFF",
+        "tab.inactiveBackground" to "#F2F2F7",
+        "tab.activeForeground" to "#000000",
+        "tab.inactiveForeground" to "#8E8E93",
+        "tab.border" to "#E5E5EA",
+        "tab.activeBorderTop" to "#007AFF",
+        "statusBar.background" to "#F2F2F7",
+        "statusBar.foreground" to "#3C3C43",
+        "statusBar.border" to "#D1D1D6",
+        "statusBar.noFolderBackground" to "#F2F2F7",
+        "statusBarItem.remoteBackground" to "#007AFF",
+        "statusBarItem.remoteForeground" to "#FFFFFF",
+        "focusBorder" to "#007AFF",
+        "button.background" to "#007AFF",
+        "button.hoverBackground" to "#0062CC",
+        "button.foreground" to "#FFFFFF",
+        "button.secondaryBackground" to "#E5E5EA",
+        "button.secondaryForeground" to "#007AFF",
+        "badge.background" to "#007AFF",
+        "badge.foreground" to "#FFFFFF",
+        "progressBar.background" to "#007AFF",
+        "textLink.foreground" to "#007AFF",
+        "textLink.activeForeground" to "#0062CC",
+        "list.activeSelectionBackground" to "#D6E6FF",
+        "list.activeSelectionForeground" to "#000000",
+        "list.inactiveSelectionBackground" to "#E5E5EA",
+        "list.hoverBackground" to "#EDEDF2",
+        "list.focusOutline" to "#007AFF",
+        "input.background" to "#FFFFFF",
+        "input.border" to "#D1D1D6",
+        "quickInput.background" to "#FFFFFF",
+        "quickInputList.focusBackground" to "#D6E6FF",
+        "menu.background" to "#FFFFFF",
+        "menu.selectionBackground" to "#007AFF",
+        "menu.selectionForeground" to "#FFFFFF",
+        "menu.separatorBackground" to "#E5E5EA",
+        "panel.background" to "#FFFFFF",
+        "panel.border" to "#D1D1D6",
+        "panelTitle.activeBorder" to "#007AFF",
+        "editor.background" to "#FFFFFF",
+        "editorLineNumber.foreground" to "#AEAEB2",
+        "editorLineNumber.activeForeground" to "#3C3C43",
+        "editorCursor.foreground" to "#007AFF",
+        "editor.selectionBackground" to "#B3D7FF",
+        "editor.lineHighlightBackground" to "#F2F2F7",
+        "notifications.background" to "#FFFFFF",
+        "widget.shadow" to "#0000001F",
+        "scrollbarSlider.background" to "#3C3C4333",
+        "scrollbarSlider.hoverBackground" to "#3C3C4355",
+        "scrollbarSlider.activeBackground" to "#3C3C4377",
+    )
+
+    /** Scoped to the light theme so a dark theme the user picks keeps its own colours. */
+    val colorCustomizations: Map<String, Any?> = linkedMapOf("[$LIGHT_THEME]" to iosLightPalette)
+
+    data class Replacement(val key: String, val previous: Any?, val next: Any?)
+
+    /** Applied only while the current value still equals [Replacement.previous]. */
+    val replacements: List<Replacement> = listOf(
+        // 滑らかなキャレット移動は入力のたびにアニメーションを走らせ、PRoot 越しの端末では重い。
+        Replacement("editor.cursorSmoothCaretAnimation", "on", "off"),
+        // スマホ幅ではミニマップの描画コストに見合う情報量がない。
+        Replacement("editor.minimap.enabled", true, false),
+        Replacement("workbench.colorCustomizations", legacyWarmPalette, colorCustomizations),
+    )
+
+    /** Added only when the key is absent. */
+    val additions: List<Pair<String, Any?>> = listOf(
+        "chat.disableAIFeatures" to true,
+        "extensions.autoCheckUpdates" to false,
+        "extensions.autoUpdate" to false,
+        "extensions.ignoreRecommendations" to true,
+        "workbench.enableExperiments" to false,
+        "workbench.settings.enableNaturalLanguageSearch" to false,
+        "search.followSymlinks" to false,
+        "workbench.tips.enabled" to false,
+    )
+
+    /** Settings a fresh install starts with (equal to the old defaults after [migrate]). */
+    fun defaults(): Map<String, Any?> = linkedMapOf(
+        "workbench.startupEditor" to "none",
+        "workbench.colorTheme" to LIGHT_THEME,
+        "workbench.iconTheme" to "vs-seti",
+        "workbench.commandPalette.experimental.suggestCommands" to true,
+        "workbench.editor.showTabs" to "multiple",
+        "workbench.editor.tabSizing" to "shrink",
+        "workbench.list.smoothScrolling" to true,
+        "workbench.tree.indent" to 16,
+        "workbench.colorCustomizations" to colorCustomizations,
+        "workbench.enableExperiments" to false,
+        "workbench.settings.enableNaturalLanguageSearch" to false,
+        "workbench.tips.enabled" to false,
+        "window.commandCenter" to true,
+        "window.menuBarVisibility" to "compact",
+        "editor.fontSize" to 14,
+        "editor.lineHeight" to 22,
+        "editor.fontLigatures" to true,
+        "editor.cursorSmoothCaretAnimation" to "off",
+        "editor.cursorBlinking" to "smooth",
+        "editor.smoothScrolling" to true,
+        "editor.stickyScroll.enabled" to true,
+        "editor.minimap.enabled" to false,
+        "editor.wordWrap" to "on",
+        "editor.multiCursorModifier" to "ctrlCmd",
+        "terminal.integrated.fontSize" to 13,
+        "terminal.integrated.cursorBlinking" to true,
+        "terminal.integrated.smoothScrolling" to true,
+        "terminal.integrated.defaultProfile.linux" to "bash",
+        "files.autoSave" to "afterDelay",
+        "files.autoSaveDelay" to 1_000,
+        "files.trimTrailingWhitespace" to false,
+        "search.useIgnoreFiles" to true,
+        "search.followSymlinks" to false,
+        "git.autofetch" to false,
+        "git.confirmSync" to true,
+        "extensions.autoCheckUpdates" to false,
+        "extensions.autoUpdate" to false,
+        "extensions.ignoreRecommendations" to true,
+        "chat.disableAIFeatures" to true,
+        "telemetry.telemetryLevel" to "off",
+    )
+
+    fun defaultSettingsText(): String = render(defaults(), "", "  ", "\n") + "\n"
+
+    sealed interface Outcome {
+        data class Updated(val text: String, val changedKeys: List<String>) : Outcome
+        data object Unchanged : Outcome
+        data class Skipped(val reason: String) : Outcome
+    }
+
+    fun migrate(text: String): Outcome {
+        val document = try {
+            parseDocument(text)
+        } catch (_: CommentFound) {
+            return Outcome.Skipped("コメントを含む設定ファイルは書き換えません")
+        } catch (failure: ParseFailure) {
+            return Outcome.Skipped("JSONとして読めません: ${failure.message}")
+        }
+
+        val newline = if ("\r\n" in text) "\r\n" else "\n"
+        val firstIndent = document.members.firstOrNull()?.let { lineIndent(text, it.keyStart) }
+        val unit = firstIndent?.takeIf { it.isNotEmpty() } ?: "  "
+        val memberIndent = firstIndent ?: unit
+
+        val edits = mutableListOf<Edit>()
+        val changed = mutableListOf<String>()
+        for (rule in replacements) {
+            // 重複キーは Code - OSS と同じく最後の値が有効。
+            val member = document.members.lastOrNull { it.key == rule.key } ?: continue
+            if (!jsonEquals(member.value, rule.previous)) continue
+            val indent = lineIndent(text, member.keyStart) ?: memberIndent
+            edits += Edit(member.valueStart, member.valueEnd, render(rule.next, indent, unit, newline))
+            changed += rule.key
+        }
+
+        val missing = additions.filter { (key, _) -> document.members.none { it.key == key } }
+        if (missing.isNotEmpty()) {
+            val last = document.members.lastOrNull()
+            if (last == null) {
+                // 空のオブジェクトは波括弧ごと描き直す。
+                val body = LinkedHashMap<String, Any?>().apply { missing.forEach { put(it.first, it.second) } }
+                edits += Edit(document.openIndex, document.closeIndex + 1, render(body, "", unit, newline))
+            } else {
+                val inserted = missing.joinToString("") { (key, value) ->
+                    ",$newline$memberIndent${quote(key)}: ${render(value, memberIndent, unit, newline)}"
+                }
+                edits += Edit(last.valueEnd, last.valueEnd, inserted)
+            }
+            changed += missing.map { it.first }
+        }
+
+        if (edits.isEmpty()) return Outcome.Unchanged
+        val result = StringBuilder(text)
+        edits.sortedByDescending { it.start }.forEach { result.replace(it.start, it.end, it.text) }
+        val migrated = result.toString()
+        // 念のため書き込む前に結果を読み直す。壊れた JSON は決して書かない。
+        try {
+            parseDocument(migrated)
+        } catch (failure: RuntimeException) {
+            return Outcome.Skipped("移行結果を検証できません: ${failure.message}")
+        }
+        return Outcome.Updated(migrated, changed)
+    }
+
+    /** Structural JSON equality: object key order is ignored, numbers compare by value. */
+    fun jsonEquals(a: Any?, b: Any?): Boolean = when {
+        a is Number && b is Number ->
+            BigDecimal(a.toString()).compareTo(BigDecimal(b.toString())) == 0
+        a is Map<*, *> && b is Map<*, *> ->
+            a.size == b.size && a.all { (key, value) -> b.containsKey(key) && jsonEquals(value, b[key]) }
+        a is List<*> && b is List<*> ->
+            a.size == b.size && a.indices.all { jsonEquals(a[it], b[it]) }
+        else -> a == b
+    }
+
+    /** Parses a whole document; the top level must be an object. */
+    fun parse(text: String): Map<String, Any?> = parseDocument(text).value
+
+    fun render(value: Any?, indent: String, unit: String, newline: String): String = when (value) {
+        null -> "null"
+        is String -> quote(value)
+        is Boolean, is Number -> value.toString()
+        is Map<*, *> -> if (value.isEmpty()) "{}" else value.entries.joinToString(
+            separator = ",$newline",
+            prefix = "{$newline",
+            postfix = "$newline$indent}",
+        ) { (key, item) ->
+            "$indent$unit${quote(key.toString())}: ${render(item, indent + unit, unit, newline)}"
+        }
+        is List<*> -> if (value.isEmpty()) "[]" else value.joinToString(
+            separator = ",$newline",
+            prefix = "[$newline",
+            postfix = "$newline$indent]",
+        ) { item -> "$indent$unit${render(item, indent + unit, unit, newline)}" }
+        else -> throw IllegalArgumentException("JSONにできない値です: ${value::class.java.name}")
+    }
+
+    private fun quote(value: String): String = buildString(value.length + 2) {
+        append('"')
+        value.forEach { c ->
+            when {
+                c == '"' -> append("\\\"")
+                c == '\\' -> append("\\\\")
+                c == '\n' -> append("\\n")
+                c == '\r' -> append("\\r")
+                c == '\t' -> append("\\t")
+                c == '\b' -> append("\\b")
+                c == '\u000C' -> append("\\f")
+                c < ' ' -> append("\\u%04x".format(c.code))
+                else -> append(c)
+            }
+        }
+        append('"')
+    }
+
+    /** Whitespace before [index] on its line, or null when other text precedes it. */
+    private fun lineIndent(text: String, index: Int): String? {
+        var start = index
+        while (start > 0 && text[start - 1] != '\n') {
+            val c = text[start - 1]
+            if (c != ' ' && c != '\t') return null
+            start--
+        }
+        return text.substring(start, index)
+    }
+
+    private data class Edit(val start: Int, val end: Int, val text: String)
+
+    private data class Member(
+        val key: String,
+        val keyStart: Int,
+        val valueStart: Int,
+        val valueEnd: Int,
+        val value: Any?,
+    )
+
+    private class Document(
+        val value: Map<String, Any?>,
+        val members: List<Member>,
+        val openIndex: Int,
+        val closeIndex: Int,
+    )
+
+    private class CommentFound : RuntimeException()
+
+    private class ParseFailure(message: String) : RuntimeException(message)
+
+    private fun parseDocument(text: String): Document {
+        val reader = Reader(text)
+        if (text.startsWith('﻿')) reader.pos = 1
+        reader.skipWhitespace()
+        if (reader.peek() != '{') reader.fail("トップレベルがオブジェクトではありません")
+        val openIndex = reader.pos
+        val members = mutableListOf<Member>()
+        val value = reader.readObject(0, members)
+        val closeIndex = reader.pos - 1
+        reader.skipWhitespace()
+        if (reader.pos != text.length) reader.fail("オブジェクトの後ろに余分な文字があります")
+        return Document(value, members, openIndex, closeIndex)
+    }
+
+    /** Strict JSON reader that also accepts trailing commas, as Code - OSS does. */
+    private class Reader(private val text: String) {
+        var pos = 0
+
+        fun fail(message: String): Nothing = throw ParseFailure("$message (offset $pos)")
+
+        fun peek(): Char = if (pos < text.length) text[pos] else '\u0000'
+
+        fun skipWhitespace() {
+            while (pos < text.length) {
+                when (text[pos]) {
+                    ' ', '\t', '\n', '\r' -> pos++
+                    '/' -> {
+                        val next = text.getOrNull(pos + 1)
+                        if (next == '/' || next == '*') throw CommentFound()
+                        fail("予期しない '/'")
+                    }
+                    else -> return
+                }
+            }
+        }
+
+        fun readValue(depth: Int): Any? {
+            if (depth > MAX_DEPTH) fail("入れ子が深すぎます")
+            skipWhitespace()
+            return when (val c = peek()) {
+                '{' -> readObject(depth, null)
+                '[' -> readArray(depth)
+                '"' -> readString()
+                't' -> readLiteral("true", true)
+                'f' -> readLiteral("false", false)
+                'n' -> readLiteral("null", null)
+                else -> if (c == '-' || c in '0'..'9') readNumber() else fail("予期しない文字")
+            }
+        }
+
+        fun readObject(depth: Int, members: MutableList<Member>?): Map<String, Any?> {
+            pos++ // '{'
+            val result = LinkedHashMap<String, Any?>()
+            skipWhitespace()
+            if (peek() == '}') {
+                pos++
+                return result
+            }
+            while (true) {
+                skipWhitespace()
+                if (peek() != '"') fail("プロパティ名がありません")
+                val keyStart = pos
+                val key = readString()
+                skipWhitespace()
+                if (peek() != ':') fail("':' がありません")
+                pos++
+                skipWhitespace()
+                val valueStart = pos
+                val value = readValue(depth + 1)
+                // 重複キーは最後の値が有効(Code - OSS の jsonc パーサーと同じ)。
+                result.remove(key)
+                result[key] = value
+                members?.add(Member(key, keyStart, valueStart, pos, value))
+                skipWhitespace()
+                when (peek()) {
+                    ',' -> {
+                        pos++
+                        skipWhitespace()
+                        if (peek() == '}') {
+                            pos++
+                            return result
+                        }
+                    }
+                    '}' -> {
+                        pos++
+                        return result
+                    }
+                    else -> fail("',' か '}' がありません")
+                }
+            }
+        }
+
+        private fun readArray(depth: Int): List<Any?> {
+            pos++ // '['
+            val result = ArrayList<Any?>()
+            skipWhitespace()
+            if (peek() == ']') {
+                pos++
+                return result
+            }
+            while (true) {
+                result += readValue(depth + 1)
+                skipWhitespace()
+                when (peek()) {
+                    ',' -> {
+                        pos++
+                        skipWhitespace()
+                        if (peek() == ']') {
+                            pos++
+                            return result
+                        }
+                    }
+                    ']' -> {
+                        pos++
+                        return result
+                    }
+                    else -> fail("',' か ']' がありません")
+                }
+            }
+        }
+
+        private fun readString(): String {
+            pos++ // '"'
+            val result = StringBuilder()
+            while (true) {
+                if (pos >= text.length) fail("文字列が閉じていません")
+                val c = text[pos++]
+                when {
+                    c == '"' -> return result.toString()
+                    c == '\\' -> {
+                        if (pos >= text.length) fail("文字列が閉じていません")
+                        when (text[pos++]) {
+                            '"' -> result.append('"')
+                            '\\' -> result.append('\\')
+                            '/' -> result.append('/')
+                            'b' -> result.append('\b')
+                            'f' -> result.append('\u000C')
+                            'n' -> result.append('\n')
+                            'r' -> result.append('\r')
+                            't' -> result.append('\t')
+                            'u' -> {
+                                val hex = text.substring(pos, (pos + 4).coerceAtMost(text.length))
+                                if (hex.length != 4 || !hex.all { it.isHexDigitChar() }) {
+                                    fail("不正な \\u エスケープ")
+                                }
+                                result.append(hex.toInt(16).toChar())
+                                pos += 4
+                            }
+                            else -> fail("不正なエスケープ")
+                        }
+                    }
+                    c < ' ' -> fail("文字列に制御文字があります")
+                    else -> result.append(c)
+                }
+            }
+        }
+
+        private fun readNumber(): BigDecimal {
+            val start = pos
+            if (peek() == '-') pos++
+            when {
+                peek() == '0' -> pos++
+                peek() in '1'..'9' -> while (peek() in '0'..'9') pos++
+                else -> fail("不正な数値")
+            }
+            if (peek() == '.') {
+                pos++
+                if (peek() !in '0'..'9') fail("不正な数値")
+                while (peek() in '0'..'9') pos++
+            }
+            if (peek() == 'e' || peek() == 'E') {
+                pos++
+                if (peek() == '+' || peek() == '-') pos++
+                if (peek() !in '0'..'9') fail("不正な数値")
+                while (peek() in '0'..'9') pos++
+            }
+            return BigDecimal(text.substring(start, pos))
+        }
+
+        private fun readLiteral(word: String, value: Any?): Any? {
+            if (!text.startsWith(word, pos)) fail("不正なリテラル")
+            pos += word.length
+            return value
+        }
+
+        private fun Char.isHexDigitChar(): Boolean =
+            this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+    }
 }

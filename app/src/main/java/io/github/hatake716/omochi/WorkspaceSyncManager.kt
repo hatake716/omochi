@@ -3,12 +3,13 @@ package io.github.hatake716.omochi
 import android.content.Context
 import android.content.Intent
 import android.database.ContentObserver
+import android.database.Cursor
 import android.net.Uri
 import android.os.FileObserver
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
 import androidx.core.content.edit
-import androidx.documentfile.provider.DocumentFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -16,12 +17,16 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -33,8 +38,14 @@ import java.util.concurrent.TimeUnit
  *
  * A SAF tree URI cannot be opened as a regular Linux path by PRoot. Omochi therefore edits a
  * private mirror under `/workspace/phone/<folder>` and copies changes through ContentResolver.
- * Local FileObserver events are debounced, provider ContentObserver events request a remote
- * verification, and a short periodic scan covers providers that do not emit notifications.
+ * Local FileObserver events are coalesced for 450 ms, provider ContentObserver events request a
+ * remote verification, and an adaptive periodic scan covers providers that do not emit
+ * notifications: every 3 s after activity, stretching to 30 s while idle and backing off to
+ * 60 s while syncs fail (see [WorkspaceSyncPolicy.nextScanDelayMs]).
+ *
+ * The SAF side is read with one DocumentsContract child query per directory. A listing that
+ * fails, returns no cursor, or is still loading aborts the sync instead of looking like a set
+ * of deleted files.
  */
 object WorkspaceSyncManager {
     const val TREE_PERMISSION_FLAGS: Int =
@@ -87,7 +98,7 @@ object WorkspaceSyncManager {
         val size: Long,
         val modified: Long,
         val localFile: File? = null,
-        val document: DocumentFile? = null,
+        val remoteUri: Uri? = null,
     )
 
     private data class Snapshot(
@@ -107,12 +118,53 @@ object WorkspaceSyncManager {
         val remote: SideMetadata,
     )
 
+    /** The parsed state.json of [link], valid while the file keeps the same [stamp]. */
+    private class BaselineCache(
+        val link: Link,
+        val stamp: Pair<Long, Long>,
+        val records: Map<String, BaselineRecord>,
+    )
+
+    /** One SAF document, read from a single DocumentsContract row. */
+    private data class RemoteNode(
+        val uri: Uri,
+        val documentId: String,
+        val name: String,
+        val kind: WorkspaceSyncPolicy.Kind?,
+        val size: Long = 0L,
+        val modified: Long = 0L,
+    ) {
+        val isDirectory: Boolean get() = kind == WorkspaceSyncPolicy.Kind.Directory
+        val isFile: Boolean get() = kind == WorkspaceSyncPolicy.Kind.File
+    }
+
+    /** The linked SAF tree: [treeUri] carries the grant, [root] is its top document. */
+    private class RemoteTree(val treeUri: Uri, val root: RemoteNode)
+
     private data class SyncRequest(
         val forceLocal: Boolean,
         val forceRemote: Boolean,
         val localPaths: Set<String>,
         val announce: Boolean,
     )
+
+    private data class SyncResult(
+        val summary: Summary,
+        /** True when the sync copied, deleted, or re-recorded anything. */
+        val changed: Boolean,
+    )
+
+    /** Why a sync was requested, ordered by priority. */
+    private enum class Trigger {
+        /** The adaptive timer. Follows the failure backoff and does not count as activity. */
+        Periodic,
+
+        /** A FileObserver or ContentObserver change. Retries at most every 3 s while failing. */
+        Change,
+
+        /** start/stop/requestSync. Runs without waiting for a failure backoff. */
+        Explicit,
+    }
 
     private class Counters {
         var imported = 0
@@ -183,18 +235,36 @@ object WorkspaceSyncManager {
     @Volatile private var appContext: Context? = null
     @Volatile private var runtimeActive = false
     @Volatile private var lastFullRemoteVerification = 0L
+    @Volatile private var baselineCache: BaselineCache? = null
+
+    /** Until this monotonic time, provider notifications are treated as echoes of our writes. */
+    @Volatile private var remoteWritesUntil = Long.MIN_VALUE
+
+    /** Mirror paths this process just replaced or deleted, with the monotonic time the echo ends. */
+    private val selfWrites = ConcurrentHashMap<String, Long>()
 
     private var executor: ScheduledExecutorService? = null
-    private var periodicTask: ScheduledFuture<*>? = null
+
+    // Guarded by observerLock.
     private var contentObserver: ContentObserver? = null
     private var fileObserver: RecursiveWorkspaceObserver? = null
+    private var observedLink: Link? = null
 
+    // Guarded by queueLock.
+    private var periodicTask: ScheduledFuture<*>? = null
+    private var drainTask: ScheduledFuture<*>? = null
+    private var drainAt = 0L
+    private var draining = false
     private var requestPending = false
-    private var workerScheduled = false
     private var pendingForceLocal = false
     private var pendingForceRemote = false
     private var pendingAnnouncement = false
+    private var pendingTrigger = Trigger.Periodic
+    private var pendingRunAt = Long.MAX_VALUE
     private val pendingLocalPaths = linkedSetOf<String>()
+    private var quietScans = 0
+    private var consecutiveFailures = 0
+    private var lastFailureAt = 0L
 
     fun state(context: Context): State {
         ensureLoaded(context.applicationContext)
@@ -216,33 +286,27 @@ object WorkspaceSyncManager {
         ensureLoaded(app)
         appContext = app
         runtimeActive = true
-        synchronized(queueLock) {
-            if (periodicTask?.isCancelled != false) {
-                periodicTask = executor().scheduleWithFixedDelay(
-                    {
-                        val now = System.currentTimeMillis()
-                        val forceRemote = now - lastFullRemoteVerification >= FULL_VERIFY_INTERVAL_MS
-                        enqueue(app, forceLocal = false, forceRemote = forceRemote, delayMs = 0L)
-                    },
-                    1L,
-                    PERIODIC_SCAN_SECONDS,
-                    TimeUnit.SECONDS,
-                )
-            }
-        }
-        activeLink?.let { refreshObservers(app, it) }
-        enqueue(app, forceLocal = false, forceRemote = true, delayMs = 0L)
+        val link = activeLink ?: return
+        // Walking the mirror and registering up to MAX_FILE_OBSERVERS inotify watches can take a
+        // while on a large tree, so it runs on the sync thread instead of Service.onCreate's main
+        // thread. It is queued before the first scan so edits made during that scan are seen.
+        executor().execute { watchLocalTree(app, link) }
+        enqueue(app, forceLocal = false, forceRemote = true, delayMs = 0L, trigger = Trigger.Explicit)
     }
 
     /** Stops observers and the periodic timer, then requests one final loss-averse flush. */
     fun stop() {
+        // Cleared before taking either lock: the sync thread re-checks it under the same locks
+        // before it re-arms the timer or registers observers, so neither can outlive stop().
         runtimeActive = false
-        periodicTask?.cancel(false)
-        periodicTask = null
+        synchronized(queueLock) {
+            periodicTask?.cancel(false)
+            periodicTask = null
+        }
         clearObservers()
         appContext?.let { app ->
             if (activeLink != null) {
-                enqueue(app, forceLocal = true, forceRemote = true, delayMs = 0L)
+                enqueue(app, forceLocal = true, forceRemote = true, delayMs = 0L, trigger = Trigger.Explicit)
             }
         }
     }
@@ -259,13 +323,13 @@ object WorkspaceSyncManager {
         executor().execute {
             val previous = activeLink
             var switchedLink = false
-            runCatching {
+            val result = runCatching {
                 app.contentResolver.takePersistableUriPermission(treeUri, TREE_PERMISSION_FLAGS)
                 check(hasReadWriteAccess(app, treeUri)) {
                     "このフォルダの永続的な読み書き権限を取得できません。"
                 }
-                val root = requireRemoteRoot(app, treeUri)
-                val label = root.name?.takeIf { it.isNotBlank() } ?: "端末フォルダ"
+                val remote = requireRemoteRoot(app, treeUri)
+                val label = remote.root.name.takeIf { it.isNotBlank() } ?: "端末フォルダ"
                 val relative = if (previous?.treeUri == treeUri) {
                     previous.localRelativePath
                 } else {
@@ -278,7 +342,7 @@ object WorkspaceSyncManager {
                 saveLink(app, link)
                 switchedLink = true
                 clearObservers()
-                val summary = performSync(
+                performSync(
                     context = app,
                     link = link,
                     request = SyncRequest(
@@ -288,7 +352,6 @@ object WorkspaceSyncManager {
                         announce = true,
                     ),
                 )
-                summary
             }.also {
                 if (switchedLink && previous != null && previous.treeUri != treeUri) {
                     releaseAccess(app, previous.treeUri)
@@ -296,6 +359,7 @@ object WorkspaceSyncManager {
             }.onFailure { error ->
                 publish(State.Failed(activeLink ?: previous, readableError(error)))
             }
+            synchronized(queueLock) { finishAttemptLocked(app, result) }
         }
     }
 
@@ -307,6 +371,12 @@ object WorkspaceSyncManager {
             val previous = activeLink
             clearObservers()
             activeLink = null
+            synchronized(queueLock) {
+                periodicTask?.cancel(false)
+                periodicTask = null
+            }
+            baselineCache = null
+            selfWrites.clear()
             app.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit(commit = true) { clear() }
             runCatching { baselineFile(app).delete() }
             previous?.let { releaseAccess(app, it.treeUri) }
@@ -325,6 +395,7 @@ object WorkspaceSyncManager {
             forceRemote = verifyBothSides,
             announce = true,
             delayMs = 0L,
+            trigger = Trigger.Explicit,
         )
     }
 
@@ -378,6 +449,7 @@ object WorkspaceSyncManager {
         localPath: String? = null,
         announce: Boolean = false,
         delayMs: Long = LOCAL_DEBOUNCE_MS,
+        trigger: Trigger = Trigger.Change,
     ) {
         if (activeLink == null) return
         synchronized(queueLock) {
@@ -385,53 +457,140 @@ object WorkspaceSyncManager {
             pendingForceLocal = pendingForceLocal || forceLocal
             pendingForceRemote = pendingForceRemote || forceRemote
             pendingAnnouncement = pendingAnnouncement || announce
+            if (trigger > pendingTrigger) pendingTrigger = trigger
+            // Anything but the timer itself is activity: return to the short scan interval.
+            if (trigger != Trigger.Periodic) quietScans = 0
             localPath?.let { pendingLocalPaths += it }
-            if (workerScheduled) return
-            workerScheduled = true
-            executor().schedule({ drainQueue(context) }, delayMs, TimeUnit.MILLISECONDS)
+            pendingRunAt = minOf(pendingRunAt, nowMs() + delayMs)
+            scheduleDrainLocked(context)
         }
     }
 
+    /**
+     * Schedules the single drain task for the pending request, or pulls an already scheduled one
+     * forward. While syncs fail, the start is held back by the backoff that fits the trigger.
+     */
+    private fun scheduleDrainLocked(context: Context) {
+        if (!requestPending || draining) return
+        val notBefore = when {
+            consecutiveFailures == 0 -> Long.MIN_VALUE
+            pendingTrigger == Trigger.Explicit -> Long.MIN_VALUE
+            pendingTrigger == Trigger.Change ->
+                lastFailureAt + WorkspaceSyncPolicy.changeRetryDelayMs(consecutiveFailures)
+            else -> lastFailureAt + WorkspaceSyncPolicy.retryDelayMs(consecutiveFailures)
+        }
+        val runAt = maxOf(pendingRunAt, notBefore)
+        drainTask?.let { scheduled ->
+            if (drainAt <= runAt) return
+            // A task that already started will take the pending request when it gets the lock.
+            if (!scheduled.cancel(false)) return
+        }
+        drainAt = runAt
+        drainTask = executor().schedule(
+            { drainQueue(context) },
+            (runAt - nowMs()).coerceAtLeast(0L),
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    /**
+     * Runs one coalesced request. Requests that arrive meanwhile are scheduled as a new task
+     * instead of looping here, so connect/disconnect queued on the same thread are not starved.
+     */
     private fun drainQueue(context: Context) {
-        while (true) {
-            val request = synchronized(queueLock) {
-                if (!requestPending) {
-                    workerScheduled = false
-                    return
-                }
-                SyncRequest(
-                    forceLocal = pendingForceLocal,
-                    forceRemote = pendingForceRemote,
-                    localPaths = pendingLocalPaths.toSet(),
-                    announce = pendingAnnouncement,
-                ).also {
-                    requestPending = false
-                    pendingForceLocal = false
-                    pendingForceRemote = false
-                    pendingAnnouncement = false
-                    pendingLocalPaths.clear()
-                }
+        val request = synchronized(queueLock) {
+            drainTask = null
+            if (!requestPending) return
+            draining = true
+            SyncRequest(
+                forceLocal = pendingForceLocal,
+                // Checked here rather than only by the timer: steady edits keep re-arming the
+                // timer before it fires, and must not postpone the periodic full verification.
+                forceRemote = pendingForceRemote || (
+                    runtimeActive && WorkspaceSyncPolicy.fullVerificationDue(
+                        nowMs = System.currentTimeMillis(),
+                        lastVerifiedAtMs = lastFullRemoteVerification,
+                    )
+                ),
+                localPaths = pendingLocalPaths.toSet(),
+                announce = pendingAnnouncement,
+            ).also {
+                requestPending = false
+                pendingForceLocal = false
+                pendingForceRemote = false
+                pendingAnnouncement = false
+                pendingTrigger = Trigger.Periodic
+                pendingRunAt = Long.MAX_VALUE
+                pendingLocalPaths.clear()
             }
-            val link = activeLink ?: continue
-            runCatching { performSync(context, link, request) }
-                .onFailure { error -> publish(State.Failed(link, readableError(error))) }
+        }
+        var result: Result<SyncResult>? = null
+        try {
+            val link = activeLink
+            if (link != null) {
+                result = runCatching { performSync(context, link, request) }
+                    .onFailure { error -> publishFailure(link, readableError(error)) }
+            }
+        } finally {
+            // One critical section, so a request arriving in between cannot be scheduled with
+            // the failure count from before this attempt.
+            synchronized(queueLock) {
+                draining = false
+                finishAttemptLocked(context, result)
+            }
         }
     }
 
-    private fun performSync(context: Context, link: Link, request: SyncRequest): Summary {
+    /** Updates the cadence after a sync attempt, then re-arms the drain and the timer. */
+    private fun finishAttemptLocked(context: Context, result: Result<SyncResult>?) {
+        val synced = result?.getOrNull()
+        when {
+            result == null -> Unit
+            synced != null -> {
+                consecutiveFailures = 0
+                quietScans = if (synced.changed) 0 else (quietScans + 1).coerceAtMost(MAX_TRACKED_ATTEMPTS)
+            }
+            else -> {
+                consecutiveFailures = (consecutiveFailures + 1).coerceAtMost(MAX_TRACKED_ATTEMPTS)
+                quietScans = 0
+                lastFailureAt = nowMs()
+            }
+        }
+        scheduleDrainLocked(context)
+        schedulePeriodicLocked(context)
+    }
+
+    private fun schedulePeriodicLocked(context: Context) {
+        if (!runtimeActive || activeLink == null) return
+        periodicTask?.cancel(false)
+        periodicTask = executor().schedule(
+            { periodicScan(context) },
+            WorkspaceSyncPolicy.nextScanDelayMs(quietScans, consecutiveFailures),
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    /** The adaptive timer. Whether the scan also re-hashes the SAF side is decided when it runs. */
+    private fun periodicScan(context: Context) {
+        if (!runtimeActive) return
+        enqueue(context, forceLocal = false, forceRemote = false, delayMs = 0L, trigger = Trigger.Periodic)
+    }
+
+    private fun performSync(context: Context, link: Link, request: SyncRequest): SyncResult {
         check(activeLink == link) { "端末フォルダの連携先が変更されました。" }
         check(hasReadWriteAccess(context, link.treeUri)) {
             "端末フォルダの読み書き権限がありません。フォルダを選び直してください。"
         }
-        val remoteRoot = requireRemoteRoot(context, link.treeUri)
+        val remote = requireRemoteRoot(context, link.treeUri)
         val localRoot = localRoot(context, link).apply { mkdirs() }
         if (request.announce) {
             publish(State.Syncing(link, "${link.label} の変更を確認しています…"))
         }
 
+        pruneSelfWrites()
         val baseline = loadBaseline(context, link)
         val localSnapshot = scanLocal(localRoot)
-        val remoteSnapshot = scanRemote(remoteRoot)
+        val remoteSnapshot = scanRemote(context, remote)
         val localResolved = resolveEntries(
             context,
             localSnapshot.entries,
@@ -477,11 +636,11 @@ object WorkspaceSyncManager {
                 }
                 if (request.forceRemote) lastFullRemoteVerification = now
                 publish(State.Ready(link, now, summary))
-                if (runtimeActive) refreshObservers(context, link)
             } else if (request.forceRemote) {
                 lastFullRemoteVerification = System.currentTimeMillis()
             }
-            return summary
+            updateObservers(context, link, localSnapshot)
+            return SyncResult(summary, changed = !unchanged)
         }
         val recovery = Recovery(context, link)
         val affected = linkedSetOf<String>()
@@ -492,7 +651,7 @@ object WorkspaceSyncManager {
             executeAction(
                 context = context,
                 link = link,
-                remoteRoot = remoteRoot,
+                remote = remote,
                 action = action,
                 expectedLocal = localResolved,
                 expectedRemote = remoteResolved,
@@ -503,9 +662,10 @@ object WorkspaceSyncManager {
         }
 
         var records: Map<String, BaselineRecord>? = null
+        var verifiedLocal: Snapshot? = null
         for (attempt in 1..FINAL_VERIFY_ATTEMPTS) {
             val finalLocalRaw = scanLocal(localRoot)
-            val finalRemoteRaw = scanRemote(remoteRoot)
+            val finalRemoteRaw = scanRemote(context, remote)
             val finalLocal = resolveEntries(
                 context,
                 finalLocalRaw.entries,
@@ -524,11 +684,12 @@ object WorkspaceSyncManager {
             )
             if (finalLocal == finalRemote) {
                 records = buildBaseline(finalLocal, finalLocalRaw.entries, finalRemoteRaw.entries)
+                verifiedLocal = finalLocalRaw
                 break
             }
             if (attempt < FINAL_VERIFY_ATTEMPTS) Thread.sleep(FINAL_VERIFY_DELAY_MS)
         }
-        check(records != null) {
+        check(records != null && verifiedLocal != null) {
             "同期中に別の変更を検出しました。内容を保ったまま再同期します。"
         }
 
@@ -541,14 +702,14 @@ object WorkspaceSyncManager {
         counters.recoveryPath = recovery.workspacePath()
         val summary = counters.summary()
         publish(State.Ready(link, now, summary))
-        if (runtimeActive) refreshObservers(context, link)
-        return summary
+        updateObservers(context, link, verifiedLocal)
+        return SyncResult(summary, changed = true)
     }
 
     private fun executeAction(
         context: Context,
         link: Link,
-        remoteRoot: DocumentFile,
+        remote: RemoteTree,
         action: WorkspaceSyncPolicy.Action,
         expectedLocal: Map<String, WorkspaceSyncPolicy.Entry>,
         expectedRemote: Map<String, WorkspaceSyncPolicy.Entry>,
@@ -559,23 +720,23 @@ object WorkspaceSyncManager {
         when (action) {
             is WorkspaceSyncPolicy.Action.Upload -> {
                 val source = localEntry(localRoot, action.path)
-                verifyRemote(context, findDocument(remoteRoot, action.path), expectedRemote[action.path])
-                uploadPath(context, remoteRoot, source, action.path, counters, recovery)
+                verifyRemote(context, findRemote(context, remote, action.path), expectedRemote[action.path])
+                uploadPath(context, remote, source, action.path, counters, recovery)
             }
 
             is WorkspaceSyncPolicy.Action.Download -> {
-                val source = findDocument(remoteRoot, action.path)
+                val source = findRemote(context, remote, action.path)
                     ?: throw IOException("端末側の項目が見つかりません: ${action.path}")
                 verifyLocal(localEntry(localRoot, action.path), expectedLocal[action.path])
-                downloadPath(context, source, localRoot, action.path, counters, recovery)
+                downloadPath(context, remote, source, localRoot, action.path, counters, recovery)
             }
 
             is WorkspaceSyncPolicy.Action.DeleteRemote -> {
-                val target = findDocument(remoteRoot, action.path)
+                val target = findRemote(context, remote, action.path)
                     ?: throw IOException("削除する端末側の項目が見つかりません: ${action.path}")
-                assertNoProtectedRemoteMetadata(target, action.path)
-                backupRemote(context, target, recovery.destination("device", action.path))
-                deleteDocumentRecursively(target)
+                assertNoProtectedRemoteMetadata(context, remote, target, action.path)
+                backupRemote(context, remote, target, recovery.destination("device", action.path), action.path)
+                deleteRemoteRecursively(context, remote, target, action.path)
                 counters.deletedRemote += 1
             }
 
@@ -583,30 +744,32 @@ object WorkspaceSyncManager {
                 val target = localEntry(localRoot, action.path)
                 assertNoProtectedLocalMetadata(target, action.path)
                 backupLocal(target, recovery.destination("local", action.path))
+                markSelfWrite(action.path)
                 check(target.deleteRecursively()) { "ローカル項目を削除できません: ${action.path}" }
+                markSelfWrite(action.path)
                 counters.deletedLocal += 1
             }
 
             is WorkspaceSyncPolicy.Action.PreserveConflict -> {
                 val localSource = localEntry(localRoot, action.path)
-                val remoteSource = findDocument(remoteRoot, action.path)
+                val remoteSource = findRemote(context, remote, action.path)
                     ?: throw IOException("競合した端末側の項目が見つかりません: ${action.path}")
                 verifyLocal(localSource, expectedLocal[action.path])
                 verifyRemote(context, remoteSource, expectedRemote[action.path])
                 if (localSource.isFile && remoteSource.isDirectory) {
-                    assertNoProtectedRemoteMetadata(remoteSource, action.path)
+                    assertNoProtectedRemoteMetadata(context, remote, remoteSource, action.path)
                 }
-                val conflictPath = uniqueConflictPath(remoteRoot, localRoot, action.path)
-                downloadPath(context, remoteSource, localRoot, conflictPath, counters, recovery)
+                val conflictPath = uniqueConflictPath(context, remote, localRoot, action.path)
+                downloadPath(context, remote, remoteSource, localRoot, conflictPath, counters, recovery)
                 uploadPath(
                     context,
-                    remoteRoot,
+                    remote,
                     localEntry(localRoot, conflictPath),
                     conflictPath,
                     counters,
                     recovery,
                 )
-                uploadPath(context, remoteRoot, localSource, action.path, counters, recovery)
+                uploadPath(context, remote, localSource, action.path, counters, recovery)
                 counters.conflicts += 1
             }
         }
@@ -616,35 +779,55 @@ object WorkspaceSyncManager {
         val entries = linkedMapOf<String, RawEntry>()
         var excluded = 0
         val canonicalRoot = root.canonicalFile
+        val canonicalRootPath = canonicalRoot.path
 
         fun visit(directory: File, prefix: String, depth: Int) {
             check(depth <= MAX_DEPTH) { "同期フォルダの階層が深すぎます。" }
-            directory.listFiles().orEmpty().sortedBy { it.name.lowercase(Locale.ROOT) }.forEach { child ->
+            val children = directory.listFiles()
+            if (children == null) {
+                // A subdirectory removed after its parent was listed is simply gone. Any other
+                // listing failure must not read as "every child was deleted".
+                if (prefix.isNotEmpty() && Files.notExists(directory.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                    entries.remove(prefix)
+                    return
+                }
+                throw IOException(
+                    if (prefix.isEmpty()) "ローカルの同期フォルダを読み取れません。" else "ローカルフォルダを読み取れません: $prefix"
+                )
+            }
+            children.map { it.name.lowercase(Locale.ROOT) to it }.sortedBy { it.first }.forEach { (_, child) ->
                 if (isExcludedName(child.name)) {
                     excluded += 1
                     return@forEach
                 }
                 validateSegment(child.name)
-                if (Files.isSymbolicLink(child.toPath())) {
+                // One lstat per entry instead of separate isSymbolicLink/isDirectory/isFile/
+                // length/lastModified calls. An entry deleted since the listing is skipped.
+                val attributes = try {
+                    Files.readAttributes(child.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+                } catch (vanished: NoSuchFileException) {
+                    return@forEach
+                }
+                if (attributes.isSymbolicLink) {
                     throw IOException("シンボリックリンクは端末フォルダへ同期できません: ${child.name}")
                 }
-                checkContained(canonicalRoot, child)
+                checkContainedIn(canonicalRootPath, child)
                 val path = if (prefix.isEmpty()) child.name else "$prefix/${child.name}"
                 check(entries.size < MAX_ENTRIES) { "同期対象が多すぎます（上限 $MAX_ENTRIES 項目）。" }
                 when {
-                    child.isDirectory -> {
+                    attributes.isDirectory -> {
                         entries[path] = RawEntry(
                             kind = WorkspaceSyncPolicy.Kind.Directory,
                             size = 0L,
-                            modified = child.lastModified(),
+                            modified = attributes.lastModifiedTime().toMillis(),
                             localFile = child,
                         )
                         visit(child, path, depth + 1)
                     }
-                    child.isFile -> entries[path] = RawEntry(
+                    attributes.isRegularFile -> entries[path] = RawEntry(
                         kind = WorkspaceSyncPolicy.Kind.File,
-                        size = child.length(),
-                        modified = child.lastModified(),
+                        size = attributes.size(),
+                        modified = attributes.lastModifiedTime().toMillis(),
                         localFile = child,
                     )
                 }
@@ -655,46 +838,44 @@ object WorkspaceSyncManager {
         return Snapshot(entries, excluded)
     }
 
-    private fun scanRemote(root: DocumentFile): Snapshot {
+    private fun scanRemote(context: Context, remote: RemoteTree): Snapshot {
         val entries = linkedMapOf<String, RawEntry>()
         var excluded = 0
 
-        fun visit(directory: DocumentFile, prefix: String, depth: Int) {
+        fun visit(directory: RemoteNode, prefix: String, depth: Int) {
             check(depth <= MAX_DEPTH) { "端末フォルダの階層が深すぎます。" }
             val names = hashSetOf<String>()
-            directory.listFiles()
-                .sortedBy { it.name.orEmpty().lowercase(Locale.ROOT) }
-                .forEach { child ->
-                    val name = child.name ?: throw IOException("名前のない端末ファイルは同期できません。")
-                    if (isExcludedName(name)) {
-                        excluded += 1
-                        return@forEach
-                    }
-                    validateSegment(name)
-                    check(names.add(name)) { "端末フォルダに同名項目があります: $name" }
-                    val path = if (prefix.isEmpty()) name else "$prefix/$name"
-                    check(entries.size < MAX_ENTRIES) { "同期対象が多すぎます（上限 $MAX_ENTRIES 項目）。" }
-                    when {
-                        child.isDirectory -> {
-                            entries[path] = RawEntry(
-                                kind = WorkspaceSyncPolicy.Kind.Directory,
-                                size = 0L,
-                                modified = child.lastModified(),
-                                document = child,
-                            )
-                            visit(child, path, depth + 1)
-                        }
-                        child.isFile -> entries[path] = RawEntry(
-                            kind = WorkspaceSyncPolicy.Kind.File,
-                            size = child.length(),
-                            modified = child.lastModified(),
-                            document = child,
-                        )
-                    }
+            listRemoteChildren(context, remote.treeUri, directory, prefix).forEach { child ->
+                val name = child.name
+                if (isExcludedName(name)) {
+                    excluded += 1
+                    return@forEach
                 }
+                validateSegment(name)
+                check(names.add(name)) { "端末フォルダに同名項目があります: $name" }
+                val path = if (prefix.isEmpty()) name else "$prefix/$name"
+                check(entries.size < MAX_ENTRIES) { "同期対象が多すぎます（上限 $MAX_ENTRIES 項目）。" }
+                when {
+                    child.isDirectory -> {
+                        entries[path] = RawEntry(
+                            kind = WorkspaceSyncPolicy.Kind.Directory,
+                            size = 0L,
+                            modified = child.modified,
+                            remoteUri = child.uri,
+                        )
+                        visit(child, path, depth + 1)
+                    }
+                    child.isFile -> entries[path] = RawEntry(
+                        kind = WorkspaceSyncPolicy.Kind.File,
+                        size = child.size,
+                        modified = child.modified,
+                        remoteUri = child.uri,
+                    )
+                }
+            }
         }
 
-        visit(root, "", 0)
+        visit(remote.root, "", 0)
         return Snapshot(entries, excluded)
     }
 
@@ -717,15 +898,13 @@ object WorkspaceSyncManager {
                 Side.Remote -> previous?.remote
             }
             val metadata = value.metadata()
-            val forced = forceAll || forcePaths.any { forcedPath ->
-                forcedPath.isEmpty() || path == forcedPath || path.startsWith("$forcedPath/")
-            }
+            val forced = forceAll || WorkspaceSyncPolicy.isWithin(path, forcePaths)
             val digest = if (!forced && previous?.entry?.kind == WorkspaceSyncPolicy.Kind.File &&
                 previousMetadata == metadata
             ) {
                 previous.entry.digest!!
             } else {
-                digest(openInput(context, value))
+                digest(openInput(context, value, path))
             }
             WorkspaceSyncPolicy.Entry(WorkspaceSyncPolicy.Kind.File, digest)
         }
@@ -752,8 +931,23 @@ object WorkspaceSyncManager {
         }
     }
 
-    private fun loadBaseline(context: Context, link: Link): Map<String, BaselineRecord> = runCatching {
+    /**
+     * Returns the saved baseline. Only this thread writes state.json, so the parsed records are
+     * reused while the file keeps its modification time and length instead of being re-parsed
+     * on every scan.
+     */
+    private fun loadBaseline(context: Context, link: Link): Map<String, BaselineRecord> {
         val file = baselineFile(context)
+        val stamp = file.lastModified() to file.length()
+        baselineCache?.let { cached ->
+            if (cached.link == link && cached.stamp == stamp) return cached.records
+        }
+        val records = readBaseline(file, link)
+        baselineCache = BaselineCache(link, stamp, records)
+        return records
+    }
+
+    private fun readBaseline(file: File, link: Link): Map<String, BaselineRecord> = runCatching {
         if (!file.isFile) return@runCatching emptyMap()
         val root = JSONObject(file.readText(Charsets.UTF_8))
         if (root.optInt("version") != BASELINE_VERSION ||
@@ -819,72 +1013,108 @@ object WorkspaceSyncManager {
         val destination = baselineFile(context)
         destination.parentFile?.mkdirs()
         val temporary = File(destination.parentFile, "${destination.name}.tmp")
+        // Never let a failed write leave records cached for a file that now holds other data.
+        baselineCache = null
         temporary.writeText(root.toString(), Charsets.UTF_8)
         moveReplacing(temporary, destination)
+        baselineCache = BaselineCache(link, destination.lastModified() to destination.length(), records)
     }
 
     private fun uploadPath(
         context: Context,
-        remoteRoot: DocumentFile,
+        remote: RemoteTree,
         source: File,
         path: String,
         counters: Counters,
         recovery: Recovery,
     ) {
         check(!Files.isSymbolicLink(source.toPath())) { "シンボリックリンクは同期できません: $path" }
-        val parent = ensureRemoteParent(remoteRoot, path.substringBeforeLast('/', ""))
-        uploadEntry(context, source, parent, path.substringAfterLast('/'), path, counters, recovery)
+        val parentPath = path.substringBeforeLast('/', "")
+        val parent = ensureRemoteParent(context, remote, parentPath)
+        val name = path.substringAfterLast('/')
+        val existing = remoteChild(context, remote, parent, parentPath, name)
+        uploadEntry(context, remote, source, parent, name, path, existing, counters, recovery, depth = 0)
     }
 
     private fun uploadEntry(
         context: Context,
+        remote: RemoteTree,
         source: File,
-        remoteParent: DocumentFile,
+        remoteParent: RemoteNode,
         name: String,
         path: String,
+        existing: RemoteNode?,
         counters: Counters,
         recovery: Recovery,
+        depth: Int,
     ) {
-        val existing = remoteParent.findFile(name)
+        check(depth <= MAX_DEPTH) { "同期フォルダの階層が深すぎます。" }
         if (source.isDirectory) {
             val directory = when {
-                existing == null -> remoteParent.createDirectory(name)
+                existing == null -> createRemoteDirectory(context, remoteParent, name)
                 existing.isDirectory -> existing
                 else -> {
-                    backupRemote(context, existing, recovery.destination("device", path))
-                    deleteDocumentRecursively(existing)
-                    remoteParent.createDirectory(name)
+                    backupRemote(context, remote, existing, recovery.destination("device", path), path)
+                    deleteRemoteRecursively(context, remote, existing, path)
+                    createRemoteDirectory(context, remoteParent, name)
                 }
             } ?: throw IOException("端末側にフォルダを作成できません: $path")
-            source.listFiles().orEmpty().sortedBy { it.name.lowercase(Locale.ROOT) }.forEach { child ->
+            // One listing for all children instead of one lookup per child. A directory created
+            // just now is known to be empty.
+            val remoteChildren = if (directory === existing) {
+                listRemoteChildren(context, remote.treeUri, directory, path).associateBy { it.name }
+            } else {
+                emptyMap()
+            }
+            val children = source.listFiles() ?: throw IOException("ローカルフォルダを読み取れません: $path")
+            children.sortedBy { it.name.lowercase(Locale.ROOT) }.forEach { child ->
                 if (!isExcludedName(child.name)) {
-                    uploadEntry(context, child, directory, child.name, "$path/${child.name}", counters, recovery)
+                    // The scan rejected links, but one may have appeared since; never follow it
+                    // out of the mirror into shared storage.
+                    check(!Files.isSymbolicLink(child.toPath())) {
+                        "シンボリックリンクは同期できません: $path/${child.name}"
+                    }
+                    uploadEntry(
+                        context,
+                        remote,
+                        child,
+                        directory,
+                        child.name,
+                        "$path/${child.name}",
+                        remoteChildren[child.name],
+                        counters,
+                        recovery,
+                        depth + 1,
+                    )
                 }
             }
             return
         }
 
         val target = when {
-            existing == null -> createRemoteFile(remoteParent, name)
+            existing == null -> createRemoteFile(context, remoteParent, name)
             existing.isFile -> existing
             else -> {
-                assertNoProtectedRemoteMetadata(existing, path)
-                backupRemote(context, existing, recovery.destination("device", path))
-                deleteDocumentRecursively(existing)
-                createRemoteFile(remoteParent, name)
+                assertNoProtectedRemoteMetadata(context, remote, existing, path)
+                backupRemote(context, remote, existing, recovery.destination("device", path), path)
+                deleteRemoteRecursively(context, remote, existing, path)
+                createRemoteFile(context, remoteParent, name)
             }
         }
+        markRemoteWrite()
         openRemoteOutput(context, target).use { output ->
             source.inputStream().buffered().use { input ->
                 counters.bytes += input.copyTo(output, COPY_BUFFER_SIZE)
             }
         }
+        markRemoteWrite()
         counters.exported += 1
     }
 
     private fun downloadPath(
         context: Context,
-        source: DocumentFile,
+        remote: RemoteTree,
+        source: RemoteNode,
         localRoot: File,
         path: String,
         counters: Counters,
@@ -894,25 +1124,28 @@ object WorkspaceSyncManager {
         if (target.exists() && target.isDirectory != source.isDirectory) {
             if (target.isDirectory) assertNoProtectedLocalMetadata(target, path)
             backupLocal(target, recovery.destination("local", path))
+            markSelfWrite(path)
             check(target.deleteRecursively()) { "ローカル項目を置換できません: $path" }
         }
-        downloadEntry(context, source, target, path, counters)
+        downloadEntry(context, remote, source, target, path, counters)
     }
 
     private fun downloadEntry(
         context: Context,
-        source: DocumentFile,
+        remote: RemoteTree,
+        source: RemoteNode,
         target: File,
         path: String,
         counters: Counters,
     ) {
         if (source.isDirectory) {
+            markSelfWrite(path)
             check(target.mkdirs() || target.isDirectory) { "ローカルフォルダを作成できません: $path" }
-            source.listFiles().sortedBy { it.name.orEmpty().lowercase(Locale.ROOT) }.forEach { child ->
-                val name = child.name ?: throw IOException("名前のない端末ファイルは同期できません。")
+            listRemoteChildren(context, remote.treeUri, source, path).forEach { child ->
+                val name = child.name
                 if (!isExcludedName(name)) {
                     validateSegment(name)
-                    downloadEntry(context, child, File(target, name), "$path/$name", counters)
+                    downloadEntry(context, remote, child, File(target, name), "$path/$name", counters)
                 }
             }
             return
@@ -925,21 +1158,30 @@ object WorkspaceSyncManager {
                     counters.bytes += input.copyTo(output, COPY_BUFFER_SIZE)
                 }
             } ?: throw IOException("端末ファイルを開けません: $path")
+            // The rename below is the only event the mirror's FileObserver sees for this file.
+            // It is this sync's own write, so it must not queue another sync.
+            markSelfWrite(path)
             moveReplacing(temporary, target)
-            source.lastModified().takeIf { it > 0L }?.let(target::setLastModified)
+            markSelfWrite(path)
+            source.modified.takeIf { it > 0L }?.let(target::setLastModified)
             counters.imported += 1
         } finally {
             if (temporary.exists()) temporary.delete()
         }
     }
 
-    private fun backupRemote(context: Context, source: DocumentFile, destination: File) {
+    private fun backupRemote(
+        context: Context,
+        remote: RemoteTree,
+        source: RemoteNode,
+        destination: File,
+        path: String,
+    ) {
         if (source.isDirectory) {
             destination.mkdirs()
-            source.listFiles().forEach { child ->
-                val name = child.name ?: return@forEach
-                validateSegment(name)
-                backupRemote(context, child, File(destination, name))
+            listRemoteChildren(context, remote.treeUri, source, path).forEach { child ->
+                validateSegment(child.name)
+                backupRemote(context, remote, child, File(destination, child.name), "$path/${child.name}")
             }
         } else if (source.isFile) {
             destination.parentFile?.mkdirs()
@@ -953,7 +1195,9 @@ object WorkspaceSyncManager {
         check(!Files.isSymbolicLink(source.toPath())) { "シンボリックリンクは保全できません: ${source.name}" }
         if (source.isDirectory) {
             destination.mkdirs()
-            source.listFiles().orEmpty().forEach { child ->
+            val children = source.listFiles()
+                ?: throw IOException("削除前のローカルフォルダを保全できません: ${source.name}")
+            children.forEach { child ->
                 if (!isExcludedName(child.name)) backupLocal(child, File(destination, child.name))
             }
         } else {
@@ -980,7 +1224,7 @@ object WorkspaceSyncManager {
 
     private fun verifyRemote(
         context: Context,
-        document: DocumentFile?,
+        document: RemoteNode?,
         expected: WorkspaceSyncPolicy.Entry?,
     ) {
         when {
@@ -998,7 +1242,12 @@ object WorkspaceSyncManager {
         }
     }
 
-    private fun uniqueConflictPath(remoteRoot: DocumentFile, localRoot: File, original: String): String {
+    private fun uniqueConflictPath(
+        context: Context,
+        remote: RemoteTree,
+        localRoot: File,
+        original: String,
+    ): String {
         val parent = original.substringBeforeLast('/', "")
         val name = original.substringAfterLast('/')
         val isFile = localEntry(localRoot, original).isFile
@@ -1020,20 +1269,142 @@ object WorkspaceSyncManager {
                 marker + reservedExtension
             val path = if (parent.isEmpty()) conflictName else "$parent/$conflictName"
             if (!localEntry(localRoot, path, mustExist = false).exists() &&
-                findDocument(remoteRoot, path) == null
+                findRemote(context, remote, path) == null
             ) return path
         }
         throw IOException("競合ファイル名を作成できません: $original")
     }
 
-    private fun requireRemoteRoot(context: Context, uri: Uri): DocumentFile {
-        val root = DocumentFile.fromTreeUri(context, uri)
+    /**
+     * Resolves the linked tree's top document with one query for its name, type and flags. It
+     * applies DocumentFile's isDirectory/canRead/canWrite rules; the grant itself is checked by
+     * [hasReadWriteAccess] before every caller gets here.
+     */
+    private fun requireRemoteRoot(context: Context, treeUri: Uri): RemoteTree {
+        val documentId = runCatching { rootDocumentId(treeUri) }.getOrNull()
             ?: throw IOException("選択した端末フォルダを開けません。")
-        check(root.isDirectory && root.canRead() && root.canWrite()) {
+        val uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+        var name = ""
+        var mimeType: String? = null
+        var flags = 0
+        val found = runCatching {
+            context.contentResolver.query(uri, ROOT_PROJECTION, null, null, null)?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use false
+                name = cursor.stringAt(cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)).orEmpty()
+                mimeType = cursor.stringAt(cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE))
+                flags = cursor.longAt(cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS))?.toInt() ?: 0
+                true
+            } ?: false
+        }.getOrDefault(false)
+        check(found && isWritableDirectory(mimeType, flags)) {
             "選択したフォルダには読み書きできません。"
         }
-        return root
+        return RemoteTree(
+            treeUri = treeUri,
+            root = RemoteNode(uri, documentId, name, WorkspaceSyncPolicy.Kind.Directory),
+        )
     }
+
+    /** Same document as DocumentFile.fromTreeUri, without its PackageManager lookup. */
+    private fun rootDocumentId(treeUri: Uri): String {
+        val segments = treeUri.pathSegments
+        return if (segments.size >= 4 && segments[0] == "tree" && segments[2] == "document") {
+            DocumentsContract.getDocumentId(treeUri)
+        } else {
+            DocumentsContract.getTreeDocumentId(treeUri)
+        }
+    }
+
+    /** DocumentFile.isDirectory && canWrite for a document that has already been read. */
+    private fun isWritableDirectory(mimeType: String?, flags: Int): Boolean {
+        if (mimeType != WorkspaceSyncPolicy.DIRECTORY_MIME_TYPE) return false
+        val writable = DocumentsContract.Document.FLAG_SUPPORTS_DELETE or
+            DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE or
+            DocumentsContract.Document.FLAG_SUPPORTS_WRITE
+        return flags and writable != 0
+    }
+
+    /**
+     * Lists [parent] with a single DocumentsContract query that returns every attribute the sync
+     * needs. It throws when the query fails, returns no cursor, or the provider marks the result
+     * as loading or failed, so a caller never mistakes an incomplete listing for deletions.
+     */
+    private fun listRemoteChildren(
+        context: Context,
+        treeUri: Uri,
+        parent: RemoteNode,
+        path: String,
+    ): List<RemoteNode> {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parent.documentId)
+        val listing = try {
+            context.contentResolver.query(childrenUri, CHILD_PROJECTION, null, null, null)
+                ?.use(::readChildListing)
+        } catch (error: Exception) {
+            throw IOException(remoteListingError(path), error)
+        } ?: throw IOException(remoteListingError(path))
+        return WorkspaceSyncPolicy.children(listing).map { child ->
+            RemoteNode(
+                uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, child.documentId),
+                documentId = child.documentId,
+                name = child.name,
+                kind = child.kind,
+                size = child.size,
+                modified = child.modified,
+            )
+        }
+    }
+
+    private fun readChildListing(cursor: Cursor): WorkspaceSyncPolicy.ChildListing {
+        val id = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+        val name = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+        val mimeType = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+        val size = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+        val modified = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+        val rows = ArrayList<WorkspaceSyncPolicy.ChildRow>(cursor.count.coerceAtLeast(0))
+        while (cursor.moveToNext()) {
+            rows += WorkspaceSyncPolicy.ChildRow(
+                documentId = cursor.stringAt(id),
+                displayName = cursor.stringAt(name),
+                mimeType = cursor.stringAt(mimeType),
+                size = cursor.longAt(size),
+                lastModified = cursor.longAt(modified),
+            )
+        }
+        val extras = cursor.extras
+        return WorkspaceSyncPolicy.ChildListing(
+            rows = rows,
+            loading = extras?.getBoolean(DocumentsContract.EXTRA_LOADING, false) == true,
+            error = extras?.getString(DocumentsContract.EXTRA_ERROR) != null,
+        )
+    }
+
+    private fun Cursor.stringAt(index: Int): String? =
+        if (index < 0 || isNull(index)) null else getString(index)
+
+    private fun Cursor.longAt(index: Int): Long? =
+        if (index < 0 || isNull(index)) null else getLong(index)
+
+    private fun remoteListingError(path: String): String =
+        if (path.isEmpty()) {
+            "端末フォルダの一覧を取得できません。後で再同期します。"
+        } else {
+            "端末フォルダの一覧を取得できません: $path"
+        }
+
+    private fun remoteChild(
+        context: Context,
+        remote: RemoteTree,
+        parent: RemoteNode,
+        parentPath: String,
+        name: String,
+    ): RemoteNode? =
+        listRemoteChildren(context, remote.treeUri, parent, parentPath).firstOrNull { it.name == name }
+
+    private fun remoteDisplayName(context: Context, uri: Uri): String? = runCatching {
+        context.contentResolver.query(uri, NAME_PROJECTION, null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.stringAt(0) else null
+        }
+    }.getOrNull()
 
     private fun chooseLocalRelativePath(context: Context, label: String): String {
         val workspace = OmochiRuntime.workspaceDir(context).apply { mkdirs() }
@@ -1066,62 +1437,115 @@ object WorkspaceSyncManager {
         }
     }
 
-    private fun findDocument(root: DocumentFile, path: String): DocumentFile? {
+    private fun findRemote(context: Context, remote: RemoteTree, path: String): RemoteNode? {
         validateRelativePath(path)
-        var current = root
+        var current = remote.root
+        var currentPath = ""
         path.split('/').forEach { segment ->
-            current = current.findFile(segment) ?: return null
+            if (!current.isDirectory) return null
+            current = remoteChild(context, remote, current, currentPath, segment) ?: return null
+            currentPath = if (currentPath.isEmpty()) segment else "$currentPath/$segment"
         }
         return current
     }
 
-    private fun ensureRemoteParent(root: DocumentFile, path: String): DocumentFile {
-        if (path.isEmpty()) return root
+    private fun ensureRemoteParent(context: Context, remote: RemoteTree, path: String): RemoteNode {
+        if (path.isEmpty()) return remote.root
         validateRelativePath(path)
-        var current = root
+        var current = remote.root
+        var currentPath = ""
+        var created = false
         path.split('/').forEach { segment ->
-            val existing = current.findFile(segment)
+            // Below a directory created in this loop there is nothing to look up.
+            val existing = if (created) null else remoteChild(context, remote, current, currentPath, segment)
             current = when {
-                existing == null -> current.createDirectory(segment)
+                existing == null -> createRemoteDirectory(context, current, segment)?.also { created = true }
                 existing.isDirectory -> existing
                 else -> null
             } ?: throw IOException("端末側の親フォルダを作成できません: $path")
+            currentPath = if (currentPath.isEmpty()) segment else "$currentPath/$segment"
         }
         return current
     }
 
-    private fun createRemoteFile(parent: DocumentFile, name: String): DocumentFile {
-        val created = parent.createFile(WorkspaceTransfer.mimeType(name), name)
-            ?: throw IOException("端末側にファイルを作成できません: $name")
-        if (created.name != name) {
-            created.delete()
-            throw IOException("端末のファイルプロバイダーが名前を変更しました: $name")
-        }
-        return created
+    private fun createRemoteDirectory(context: Context, parent: RemoteNode, name: String): RemoteNode? {
+        markRemoteWrite()
+        val uri = runCatching {
+            DocumentsContract.createDocument(
+                context.contentResolver,
+                parent.uri,
+                WorkspaceSyncPolicy.DIRECTORY_MIME_TYPE,
+                name,
+            )
+        }.getOrNull() ?: return null
+        markRemoteWrite()
+        return RemoteNode(uri, DocumentsContract.getDocumentId(uri), name, WorkspaceSyncPolicy.Kind.Directory)
     }
 
-    private fun openRemoteOutput(context: Context, target: DocumentFile) =
+    private fun createRemoteFile(context: Context, parent: RemoteNode, name: String): RemoteNode {
+        markRemoteWrite()
+        val uri = runCatching {
+            DocumentsContract.createDocument(
+                context.contentResolver,
+                parent.uri,
+                WorkspaceTransfer.mimeType(name),
+                name,
+            )
+        }.getOrNull() ?: throw IOException("端末側にファイルを作成できません: $name")
+        markRemoteWrite()
+        if (remoteDisplayName(context, uri) != name) {
+            deleteRemoteDocument(context, uri)
+            throw IOException("端末のファイルプロバイダーが名前を変更しました: $name")
+        }
+        return RemoteNode(uri, DocumentsContract.getDocumentId(uri), name, WorkspaceSyncPolicy.Kind.File)
+    }
+
+    private fun openRemoteOutput(context: Context, target: RemoteNode) =
         runCatching { context.contentResolver.openOutputStream(target.uri, "rwt") }.getOrNull()
             ?: context.contentResolver.openOutputStream(target.uri, "w")
             ?: throw IOException("端末側のファイルを開けません: ${target.name}")
 
-    private fun deleteDocumentRecursively(document: DocumentFile) {
-        if (document.isDirectory) document.listFiles().forEach(::deleteDocumentRecursively)
-        check(document.delete()) { "端末側の項目を削除できません: ${document.name}" }
+    private fun deleteRemoteRecursively(context: Context, remote: RemoteTree, document: RemoteNode, path: String) {
+        if (document.isDirectory) {
+            listRemoteChildren(context, remote.treeUri, document, path).forEach { child ->
+                deleteRemoteRecursively(context, remote, child, "$path/${child.name}")
+            }
+        }
+        check(deleteRemoteDocument(context, document.uri)) { "端末側の項目を削除できません: ${document.name}" }
     }
 
-    private fun assertNoProtectedRemoteMetadata(document: DocumentFile, path: String) {
-        if (containsProtectedRemoteMetadata(document, 0)) {
+    private fun deleteRemoteDocument(context: Context, uri: Uri): Boolean {
+        markRemoteWrite()
+        val deleted = runCatching { DocumentsContract.deleteDocument(context.contentResolver, uri) }
+            .getOrDefault(false)
+        markRemoteWrite()
+        return deleted
+    }
+
+    private fun assertNoProtectedRemoteMetadata(
+        context: Context,
+        remote: RemoteTree,
+        document: RemoteNode,
+        path: String,
+    ) {
+        if (containsProtectedRemoteMetadata(context, remote, document, path, 0)) {
             throw IOException(
                 "$path 内の .git は自動削除・種類置換しません。Gitデータを保護するため端末側で確認してください。"
             )
         }
     }
 
-    private fun containsProtectedRemoteMetadata(document: DocumentFile, depth: Int): Boolean {
+    private fun containsProtectedRemoteMetadata(
+        context: Context,
+        remote: RemoteTree,
+        document: RemoteNode,
+        path: String,
+        depth: Int,
+    ): Boolean {
         if (!document.isDirectory || depth > MAX_DEPTH) return false
-        return document.listFiles().any { child ->
-            child.name == ".git" || containsProtectedRemoteMetadata(child, depth + 1)
+        return listRemoteChildren(context, remote.treeUri, document, path).any { child ->
+            child.name == ".git" ||
+                containsProtectedRemoteMetadata(context, remote, child, "$path/${child.name}", depth + 1)
         }
     }
 
@@ -1135,7 +1559,8 @@ object WorkspaceSyncManager {
 
     private fun containsProtectedLocalMetadata(file: File, depth: Int): Boolean {
         if (!file.isDirectory || depth > MAX_DEPTH || Files.isSymbolicLink(file.toPath())) return false
-        return file.listFiles().orEmpty().any { child ->
+        val children = file.listFiles() ?: throw IOException("ローカルフォルダを確認できません: ${file.name}")
+        return children.any { child ->
             child.name == ".git" || containsProtectedLocalMetadata(child, depth + 1)
         }
     }
@@ -1148,10 +1573,10 @@ object WorkspaceSyncManager {
 
     private fun RawEntry.metadata() = SideMetadata(kind, size, modified)
 
-    private fun openInput(context: Context, entry: RawEntry): InputStream = when {
+    private fun openInput(context: Context, entry: RawEntry, path: String): InputStream = when {
         entry.localFile != null -> entry.localFile.inputStream().buffered()
-        entry.document != null -> context.contentResolver.openInputStream(entry.document.uri)?.buffered()
-            ?: throw IOException("端末ファイルを読み込めません: ${entry.document.name}")
+        entry.remoteUri != null -> context.contentResolver.openInputStream(entry.remoteUri)?.buffered()
+            ?: throw IOException("端末ファイルを読み込めません: $path")
         else -> error("Directory entries do not have content")
     }
 
@@ -1163,7 +1588,14 @@ object WorkspaceSyncManager {
             if (read < 0) break
             digest.update(buffer, 0, read)
         }
-        digest.digest().joinToString("") { "%02x".format(it) }
+        val bytes = digest.digest()
+        val hex = CharArray(bytes.size * 2)
+        bytes.forEachIndexed { index, byte ->
+            val value = byte.toInt() and 0xff
+            hex[index * 2] = HEX_DIGITS[value ushr 4]
+            hex[index * 2 + 1] = HEX_DIGITS[value and 0x0f]
+        }
+        String(hex)
     }
 
     private fun moveReplacing(source: File, destination: File) {
@@ -1224,12 +1656,15 @@ object WorkspaceSyncManager {
     private fun isExcludedName(name: String): Boolean =
         name == ".git" || name.startsWith(".omochi-sync-tmp-")
 
-    private fun checkContained(root: File, candidate: File) {
-        val canonicalRoot = root.canonicalFile
+    private fun checkContained(root: File, candidate: File) =
+        checkContainedIn(root.canonicalFile.path, candidate)
+
+    /** [checkContained] for a root already resolved once, as a scan checks every entry. */
+    private fun checkContainedIn(canonicalRootPath: String, candidate: File) {
         val canonicalCandidate = candidate.canonicalFile
         check(
-            canonicalCandidate.path == canonicalRoot.path ||
-                canonicalCandidate.path.startsWith(canonicalRoot.path + File.separator)
+            canonicalCandidate.path == canonicalRootPath ||
+                canonicalCandidate.path.startsWith(canonicalRootPath + File.separator)
         ) { "同期先がワークスペース外を参照しています。" }
     }
 
@@ -1267,6 +1702,16 @@ object WorkspaceSyncManager {
         main.post { listeners.forEach { listener -> listener(state) } }
     }
 
+    /**
+     * Publishes a failure unless the same failure is already showing. Retries of a persistent
+     * error would otherwise re-open the banner the user just closed on every attempt.
+     */
+    private fun publishFailure(link: Link, message: String) {
+        val current = currentState
+        if (current is State.Failed && current.link == link && current.message == message) return
+        publish(State.Failed(link, message))
+    }
+
     private fun readableError(error: Throwable): String =
         error.message?.takeIf { it.isNotBlank() } ?: "端末フォルダの同期に失敗しました。"
 
@@ -1278,33 +1723,106 @@ object WorkspaceSyncManager {
         }.also { executor = it }
     }
 
-    private fun refreshObservers(context: Context, link: Link) {
-        if (!runtimeActive || activeLink != link) return
-        synchronized(observerLock) {
-            clearObserversLocked(context)
-            val localRoot = localRoot(context, link).apply { mkdirs() }
-            fileObserver = RecursiveWorkspaceObserver(localRoot) { path ->
-                enqueue(
-                    context,
-                    forceLocal = path == null,
-                    forceRemote = false,
-                    localPath = path,
-                )
-            }.also { it.start() }
-            contentObserver = object : ContentObserver(main) {
-                override fun onChange(selfChange: Boolean) {
-                    enqueue(context, forceLocal = false, forceRemote = true)
-                }
+    /** Monotonic milliseconds, the clock ScheduledExecutorService delays are measured on. */
+    private fun nowMs(): Long = System.nanoTime() / 1_000_000L
 
-                override fun onChange(selfChange: Boolean, uri: Uri?) {
-                    onChange(selfChange)
-                }
-            }.also { observer ->
-                runCatching {
-                    context.contentResolver.registerContentObserver(link.treeUri, true, observer)
-                }
+    /** Marks [path] (and everything below it) in the mirror as written by this sync. */
+    private fun markSelfWrite(path: String) {
+        selfWrites[path] = nowMs() + SELF_EVENT_GRACE_MS
+    }
+
+    private fun isRecentSelfWrite(path: String): Boolean {
+        if (selfWrites.isEmpty()) return false
+        val now = nowMs()
+        return WorkspaceSyncPolicy.isWithin(path) { candidate ->
+            val until = selfWrites[candidate]
+            until != null && until >= now
+        }
+    }
+
+    private fun pruneSelfWrites() {
+        if (selfWrites.isEmpty()) return
+        val now = nowMs()
+        selfWrites.values.removeIf { until -> until < now }
+    }
+
+    private fun markRemoteWrite() {
+        remoteWritesUntil = nowMs() + REMOTE_ECHO_GRACE_MS
+    }
+
+    /** Local change seen by the mirror's FileObserver. [path] is null for the mirror root itself. */
+    private fun onLocalChange(context: Context, path: String?) {
+        // The sync's own downloads and deletions already ended in a verified baseline.
+        if (path != null && isRecentSelfWrite(path)) return
+        enqueue(
+            context,
+            forceLocal = path == null,
+            forceRemote = false,
+            localPath = path,
+        )
+    }
+
+    /** Registers observers for the whole mirror before a snapshot exists (service start). */
+    private fun watchLocalTree(context: Context, link: Link) {
+        synchronized(observerLock) {
+            if (!runtimeActive || activeLink != link) return
+            runCatching { observersFor(context, link).watchTree() }
+        }
+    }
+
+    /**
+     * Converges the FileObserver set to the directories of a verified local snapshot. Unchanged
+     * directories keep their inotify watch, so a sync without directory changes costs no
+     * syscalls here.
+     */
+    private fun updateObservers(context: Context, link: Link, snapshot: Snapshot) {
+        synchronized(observerLock) {
+            if (!runtimeActive || activeLink != link) return
+            val directories = snapshot.entries.mapNotNull { (path, entry) ->
+                path.takeIf { entry.kind == WorkspaceSyncPolicy.Kind.Directory }
+            }
+            val limited = if (directories.size < MAX_FILE_OBSERVERS) {
+                directories
+            } else {
+                // Shallow directories first: they cover the most paths per watch.
+                directories.map { it.count { char -> char == '/' } to it }
+                    .sortedWith(compareBy<Pair<Int, String>>({ it.first }, { it.second }))
+                    .take(MAX_FILE_OBSERVERS - 1)
+                    .map { it.second }
+            }
+            // Watches only speed up detection; the periodic scan still covers a failure here, so
+            // it must not turn an already verified sync into a failed one.
+            runCatching { observersFor(context, link).update(limited) }
+        }
+    }
+
+    /** Returns the observers for [link], replacing those of any previous link. */
+    private fun observersFor(context: Context, link: Link): RecursiveWorkspaceObserver {
+        fileObserver?.takeIf { observedLink == link }?.let { return it }
+        clearObserversLocked(context)
+        val observer = RecursiveWorkspaceObserver(localRoot(context, link)) { path ->
+            onLocalChange(context, path)
+        }
+        fileObserver = observer
+        observedLink = link
+        contentObserver = object : ContentObserver(main) {
+            override fun onChange(selfChange: Boolean) {
+                // Providers echo Omochi's own uploads and deletions, which the sync has already
+                // verified. Re-hashing the whole SAF tree for each echo is the costliest thing
+                // this loop can do, so only notifications outside that window force it.
+                if (nowMs() <= remoteWritesUntil) return
+                enqueue(context, forceLocal = false, forceRemote = true)
+            }
+
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                onChange(selfChange)
+            }
+        }.also { observer ->
+            runCatching {
+                context.contentResolver.registerContentObserver(link.treeUri, true, observer)
             }
         }
+        return observer
     }
 
     private fun clearObservers() {
@@ -1313,6 +1831,7 @@ object WorkspaceSyncManager {
                 fileObserver?.stop()
                 fileObserver = null
                 contentObserver = null
+                observedLink = null
             }
         }
     }
@@ -1324,6 +1843,7 @@ object WorkspaceSyncManager {
             runCatching { context.contentResolver.unregisterContentObserver(observer) }
         }
         contentObserver = null
+        observedLink = null
     }
 
     // The File overload was added in API 29; the path overload keeps API 26-28 support.
@@ -1332,41 +1852,94 @@ object WorkspaceSyncManager {
         private val root: File,
         private val onChanged: (String?) -> Unit,
     ) {
-        private val observers = mutableListOf<FileObserver>()
+        private inner class DirectoryObserver(
+            val relativePath: String,
+            absolutePath: String,
+        ) : FileObserver(absolutePath, FILE_OBSERVER_MASK) {
+            /** Set once the watched directory itself was deleted or moved away. */
+            @Volatile var detached = false
 
-        fun start() {
-            stop()
-            root.walkTopDown()
+            override fun onEvent(event: Int, path: String?) {
+                if (event and (FileObserver.DELETE_SELF or FileObserver.MOVE_SELF) != 0) detached = true
+                if (path != null && isExcludedName(path)) return
+                val relative = when {
+                    path == null -> relativePath.takeIf { it.isNotEmpty() }
+                    relativePath.isEmpty() -> path
+                    else -> "$relativePath/$path"
+                }
+                onChanged(relative)
+            }
+        }
+
+        /** Relative directory ("" is the root) to its watch, in registration order. */
+        private val observers = linkedMapOf<String, DirectoryObserver>()
+
+        /** Watches the tree as found on disk, for use before any snapshot exists. */
+        fun watchTree() {
+            val directories = root.walkTopDown()
                 .onEnter { directory ->
                     !isExcludedName(directory.name) && !Files.isSymbolicLink(directory.toPath())
                 }
                 .filter { it.isDirectory }
                 .take(MAX_FILE_OBSERVERS)
-                .forEach { directory ->
-                    val directoryPath = directory.relativeTo(root).invariantSeparatorsPath
-                        .takeUnless { it == "." }
-                        .orEmpty()
-                    val observer = object : FileObserver(directory.absolutePath, FILE_OBSERVER_MASK) {
-                        override fun onEvent(event: Int, path: String?) {
-                            if (path != null && isExcludedName(path)) return
-                            val relative = when {
-                                path == null -> directoryPath.takeIf { it.isNotEmpty() }
-                                directoryPath.isEmpty() -> path
-                                else -> "$directoryPath/$path"
-                            }
-                            onChanged(relative)
-                        }
-                    }
-                    observer.startWatching()
-                    observers += observer
+                .map { directory ->
+                    directory.relativeTo(root).invariantSeparatorsPath.takeUnless { it == "." }.orEmpty()
                 }
+                .filter { it.isNotEmpty() }
+                .toList()
+            update(directories)
+        }
+
+        /**
+         * Watches the root plus [directories] and nothing else. Watches that still match are
+         * kept. Stale and detached ones are stopped before new ones start: a moved directory
+         * keeps its inode, and a new watch on it would share the same inotify descriptor that
+         * stopping the old watch then removes.
+         */
+        fun update(directories: List<String>) {
+            val desired = LinkedHashSet<String>(directories.size + 1)
+            desired += ""
+            for (directory in directories) {
+                if (desired.size >= MAX_FILE_OBSERVERS) break
+                desired += directory
+            }
+            val iterator = observers.values.iterator()
+            while (iterator.hasNext()) {
+                val observer = iterator.next()
+                if (observer.detached || observer.relativePath !in desired) {
+                    observer.stopWatching()
+                    iterator.remove()
+                }
+            }
+            desired.forEach { relative ->
+                if (relative in observers) return@forEach
+                val directory = if (relative.isEmpty()) root else File(root, relative)
+                if (!directory.isDirectory) return@forEach
+                observers[relative] = DirectoryObserver(relative, directory.absolutePath).also {
+                    it.startWatching()
+                }
+            }
         }
 
         fun stop() {
-            observers.forEach(FileObserver::stopWatching)
+            observers.values.forEach(FileObserver::stopWatching)
             observers.clear()
         }
     }
+
+    private val CHILD_PROJECTION = arrayOf(
+        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        DocumentsContract.Document.COLUMN_MIME_TYPE,
+        DocumentsContract.Document.COLUMN_SIZE,
+        DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+    )
+    private val ROOT_PROJECTION = arrayOf(
+        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        DocumentsContract.Document.COLUMN_MIME_TYPE,
+        DocumentsContract.Document.COLUMN_FLAGS,
+    )
+    private val NAME_PROJECTION = arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
 
     private const val PREFERENCES = "omochi-workspace-sync-v1"
     private const val KEY_TREE_URI = "tree-uri"
@@ -1374,9 +1947,10 @@ object WorkspaceSyncManager {
     private const val KEY_LOCAL_RELATIVE = "local-relative"
     private const val KEY_LAST_SYNC = "last-sync"
     private const val BASELINE_VERSION = 1
-    private const val PERIODIC_SCAN_SECONDS = 3L
-    private const val FULL_VERIFY_INTERVAL_MS = 30_000L
     private const val LOCAL_DEBOUNCE_MS = 450L
+    private const val SELF_EVENT_GRACE_MS = 2_000L
+    private const val REMOTE_ECHO_GRACE_MS = 5_000L
+    private const val MAX_TRACKED_ATTEMPTS = 1_000
     private const val PROGRESS_INTERVAL_MS = 200L
     private const val FINAL_VERIFY_ATTEMPTS = 3
     private const val FINAL_VERIFY_DELAY_MS = 250L
@@ -1385,6 +1959,7 @@ object WorkspaceSyncManager {
     private const val MAX_DEPTH = 64
     private const val MAX_SEGMENT_BYTES = 240
     private const val MAX_FILE_OBSERVERS = 2_048
+    private const val HEX_DIGITS = "0123456789abcdef"
     private const val FILE_OBSERVER_MASK =
         FileObserver.CLOSE_WRITE or FileObserver.CREATE or FileObserver.DELETE or
             FileObserver.MOVED_FROM or FileObserver.MOVED_TO or FileObserver.DELETE_SELF or
